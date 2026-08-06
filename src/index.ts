@@ -1,6 +1,7 @@
 import express from 'express';
 import { requireAuth } from './middleware/auth';
 import { createBuild } from './routes/builds';
+import { createRepository } from './routes/repositories';
 import { register, login } from './routes/auth';
 
 const app = express();
@@ -13,6 +14,7 @@ app.post('/auth/register', register);
 app.post('/auth/login', login);
 
 // Protect the route with requireAuth middleware
+app.post('/api/repositories', requireAuth, createRepository);
 app.post('/api/builds', requireAuth, createBuild);
 
 app.listen(port, () => {
