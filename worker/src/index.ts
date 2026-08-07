@@ -19,7 +19,9 @@ const connection = new IORedis({
   maxRetriesPerRequest: null,
 });
 
-console.log('Worker is listening for jobs on "build-queue"...');
+const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
+
+log('Worker is listening for jobs on "build-queue"...');
 
 const worker = new Worker('build-queue', async (job: Job) => {
   const { buildId, repositoryUrl } = job.data;
