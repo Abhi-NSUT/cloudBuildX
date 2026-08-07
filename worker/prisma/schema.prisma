@@ -1,0 +1,73 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------
+
+enum BuildStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+// -----------------------------------------------------------------
+// Models
+// -----------------------------------------------------------------
+
+model User {
+  id           String       @id @default(uuid())
+  email        String       @unique
+  passwordHash String       @map("password_hash")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  // Relations
+  repositories Repository[]
+
+  // Map table name to lowercase plural in Postgres
+  @@map("users")
+}
+
+model Repository {
+  id        String   @id @default(uuid())
+  name      String
+  githubUrl String   @map("github_url")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Foreign Key to User
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Relations
+  builds    Build[]
+
+  @@map("repositories")
+}
+
+model Build {
+  id          String      @id @default(uuid())
+  status      BuildStatus @default(PENDING)
+  commitHash  String?     @map("commit_hash") // Optional: specific commit to build
+  
+  // Timestamps to track queue wait times and execution duration
+  createdAt   DateTime    @default(now()) @map("created_at")
+  startedAt   DateTime?   @map("started_at")
+  completedAt DateTime?   @map("completed_at")
+
+  // Foreign Key to Repository
+  repositoryId String     @map("repository_id")
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@map("builds")
+}
