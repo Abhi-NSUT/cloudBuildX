@@ -9,6 +9,11 @@ const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Healthcheck route
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Auth routes
 app.post('/auth/register', register);
 app.post('/auth/login', login);
