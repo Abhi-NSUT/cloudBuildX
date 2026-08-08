@@ -45,3 +45,62 @@ export const createBuild = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+// GET /api/builds - Fetch all builds for the authenticated user
+export const getBuilds = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.id;
+
+    const builds = await prisma.build.findMany({
+      where: {
+        repository: {
+          userId: userId
+        }
+      },
+      include: {
+        repository: {
+          select: {
+            name: true,
+            githubUrl: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      }
+    });
+
+    return res.status(200).json(builds);
+  } catch (error) {
+    console.error('Error fetching builds:', error);
+    return res.status(500).json({ error: 'Failed to fetch build history' });
+  }
+};
+
+// GET /api/builds/:id - Fetch a specific build by ID
+export const getBuildById = async (req: AuthRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id;
+
+    const build = await prisma.build.findUnique({
+      where: { id },
+      include: {
+        repository: true
+      }
+    });
+
+    if (!build) {
+      return res.status(404).json({ error: 'Build not found' });
+    }
+
+    if (build.repository.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized access to this build' });
+    }
+
+    return res.status(200).json(build);
+  } catch (error) {
+    console.error('Error fetching build details:', error);
+    return res.status(500).json({ error: 'Failed to fetch build details' });
+  }
+};

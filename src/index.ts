@@ -1,6 +1,6 @@
 import express from 'express';
 import { requireAuth } from './middleware/auth';
-import { createBuild } from './routes/builds';
+import { createBuild, getBuilds, getBuildById } from './routes/builds';
 import { createRepository } from './routes/repositories';
 import { register, login } from './routes/auth';
 import http from 'http';
@@ -24,6 +24,8 @@ app.post('/auth/login', login);
 // Protect the route with requireAuth middleware
 app.post('/api/repositories', requireAuth, createRepository);
 app.post('/api/builds', requireAuth, createBuild);
+app.get('/api/builds', requireAuth, getBuilds);
+app.get('/api/builds/:id', requireAuth, getBuildById);
 
 // 1. Wrap Express in a native HTTP server
 const server = http.createServer(app);
