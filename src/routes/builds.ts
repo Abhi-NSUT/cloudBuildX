@@ -2,6 +2,18 @@ import { Response } from 'express';
 import { prisma } from '../db';
 import { AuthRequest } from '../middleware/auth';
 import { buildQueue } from '../queue';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
+const s3Client = new S3Client({
+  region: 'us-east-1',
+  endpoint: `http://${process.env.MINIO_ENDPOINT || 'localhost'}:${process.env.MINIO_PORT || 9000}`,
+  credentials: {
+    accessKeyId: process.env.MINIO_ROOT_USER || '',
+    secretAccessKey: process.env.MINIO_ROOT_PASSWORD || ''
+  },
+  forcePathStyle: true // Required for MinIO
+});
 
 export const createBuild = async (req: AuthRequest, res: Response) => {
   try {
@@ -101,5 +113,43 @@ export const getBuildById = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error fetching build details:', error);
     return res.status(500).json({ error: 'Failed to fetch build details' });
+  }
+};
+
+// GET /api/builds/:id/artifact - Get a presigned download URL for the artifact
+export const getBuildArtifact = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user?.id;
+
+    const build = await prisma.build.findUnique({
+      where: { id },
+      include: { repository: true }
+    });
+
+    if (!build) {
+      return res.status(404).json({ error: 'Build not found' });
+    }
+
+    if (build.repository.userId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized access' });
+    }
+
+    if (build.status !== 'SUCCESS') {
+      return res.status(400).json({ error: 'Artifacts are only available for successful builds' });
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
+      Key: `builds/${id}.zip`
+    });
+
+    // URL expires in 15 minutes (900 seconds)
+    const url = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+
+    return res.status(200).json({ url });
+  } catch (error) {
+    console.error('Error generating artifact URL:', error);
+    return res.status(500).json({ error: 'Failed to generate download link' });
   }
 };

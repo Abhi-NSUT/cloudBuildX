@@ -20,6 +20,18 @@ export const BuildDetails: React.FC = () => {
   const [build, setBuild] = useState<BuildDetail | null>(null);
   const [streamStatus, setStreamStatus] = useState('CONNECTING');
 
+  const handleDownloadArtifact = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get(`http://localhost:3000/api/builds/${buildId}/artifact`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      window.location.href = res.data.url;
+    } catch (err) {
+      alert('Artifact not found or expired.');
+    }
+  };
+
   useEffect(() => {
     const fetchDetails = async () => {
       if (!buildId) return;
@@ -51,7 +63,7 @@ export const BuildDetails: React.FC = () => {
       </div>
 
       {/* Details Bar */}
-      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 grid grid-cols-4 gap-6">
+      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 grid grid-cols-5 gap-6">
         <div>
           <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Build ID</div>
           <div className="font-mono text-sm text-gray-800">{buildId}</div>
@@ -79,6 +91,18 @@ export const BuildDetails: React.FC = () => {
             }`}>
               {build?.status || 'UNKNOWN'}
             </span>
+          </div>
+        </div>
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Artifact</div>
+          <div className="font-medium">
+            {build?.status === 'SUCCESS' ? (
+              <button onClick={handleDownloadArtifact} className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1 rounded shadow">
+                Download .ZIP
+              </button>
+            ) : (
+              <span className="text-sm text-gray-400">Unavailable</span>
+            )}
           </div>
         </div>
       </div>

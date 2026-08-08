@@ -10,8 +10,21 @@ import fs from 'fs/promises';
 import path from 'path';
 import yaml from 'js-yaml';
 import { PassThrough } from 'stream';
+import { S3Client } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+import archiver = require('archiver');
 
 dotenv.config();
+
+const s3Client = new S3Client({
+  region: 'us-east-1',
+  endpoint: `http://${process.env.MINIO_ENDPOINT || 'localhost'}:${process.env.MINIO_PORT || 9000}`,
+  credentials: {
+    accessKeyId: process.env.MINIO_ROOT_USER || '',
+    secretAccessKey: process.env.MINIO_ROOT_PASSWORD || ''
+  },
+  forcePathStyle: true // Required for MinIO
+});
 
 // Initialize Prisma v7 with pg adapter
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -174,6 +187,32 @@ const worker = new Worker('build-queue', async (job: Job) => {
     if (exitCode !== 0) {
       throw new Error(`Build failed with exit code ${exitCode}`);
     }
+
+    // 9.5 Zip and Upload Artifacts to MinIO
+    console.log(`[Job ${job.id}] Zipping artifacts and uploading to MinIO...`);
+    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Compressing and uploading artifacts...' }));
+    
+    const archive = new (archiver as any).ZipArchive({ zlib: { level: 9 } });
+    const pass = new PassThrough();
+    
+    archive.pipe(pass);
+
+    const upload = new Upload({
+      client: s3Client,
+      params: {
+        Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
+        Key: `builds/${buildId}.zip`,
+        Body: pass,
+        ContentType: 'application/zip'
+      }
+    });
+
+    archive.directory(workspaceDir, false);
+    archive.finalize();
+
+    await upload.done();
+    console.log(`[Job ${job.id}] Artifacts uploaded successfully.`);
+    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts uploaded successfully.' }));
 
     // 10. Mark Success in PostgreSQL
     await prisma.build.update({

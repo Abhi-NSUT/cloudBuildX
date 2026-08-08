@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { requireAuth } from './middleware/auth';
-import { createBuild, getBuilds, getBuildById } from './routes/builds';
+import { createBuild, getBuilds, getBuildById, getBuildArtifact } from './routes/builds';
 import { createRepository } from './routes/repositories';
 import { register, login } from './routes/auth';
 import http from 'http';
@@ -28,6 +28,7 @@ app.post('/api/repositories', requireAuth, createRepository);
 app.post('/api/builds', requireAuth, createBuild);
 app.get('/api/builds', requireAuth, getBuilds);
 app.get('/api/builds/:id', requireAuth, getBuildById);
+app.get('/api/builds/:id/artifact', requireAuth, getBuildArtifact);
 
 // 1. Wrap Express in a native HTTP server
 const server = http.createServer(app);
