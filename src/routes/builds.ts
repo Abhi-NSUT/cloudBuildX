@@ -30,8 +30,7 @@ export const createBuild = async (req: AuthRequest, res: Response) => {
       repositoryUrl: repo.githubUrl,
       commitHash: build.commitHash
     }, {
-      attempts: 3, 
-      backoff: { type: 'exponential', delay: 2000 }
+      attempts: 1
     });
 
     return res.status(201).json({
@@ -80,7 +79,7 @@ export const getBuilds = async (req: AuthRequest, res: Response) => {
 // GET /api/builds/:id - Fetch a specific build by ID
 export const getBuildById = async (req: AuthRequest, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     const userId = req.user?.id;
 
     const build = await prisma.build.findUnique({
