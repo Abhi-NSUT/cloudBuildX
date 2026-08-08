@@ -25,6 +25,11 @@ const connection = new IORedis({
   maxRetriesPerRequest: null,
 });
 
+const publisher = new IORedis({
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: Number(process.env.REDIS_PORT) || 6379,
+});
+
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
 log('Worker is listening for jobs on "build-queue"...');
@@ -125,8 +130,23 @@ const worker = new Worker('build-queue', async (job: Job) => {
     const stdoutStream = new PassThrough();
     const stderrStream = new PassThrough();
 
-    stdoutStream.on('data', (chunk) => console.log(`[Job ${job.id} INFO] ${chunk.toString('utf8').trim()}`));
-    stderrStream.on('data', (chunk) => console.log(`[Job ${job.id} ERR]  ${chunk.toString('utf8').trim()}`));
+    const channel = `build-logs:${buildId}`;
+
+    stdoutStream.on('data', (chunk) => {
+      const text = chunk.toString('utf8').trim();
+      if (text) {
+        console.log(`[Job ${job.id} INFO] ${text}`);
+        publisher.publish(channel, JSON.stringify({ type: 'info', text }));
+      }
+    });
+
+    stderrStream.on('data', (chunk) => {
+      const text = chunk.toString('utf8').trim();
+      if (text) {
+        console.log(`[Job ${job.id} ERR]  ${text}`);
+        publisher.publish(channel, JSON.stringify({ type: 'error', text }));
+      }
+    });
 
     container.modem.demuxStream(logStream, stdoutStream, stderrStream);
 
@@ -161,13 +181,16 @@ const worker = new Worker('build-queue', async (job: Job) => {
       data: { status: 'SUCCESS', completedAt: new Date() }
     });
     console.log(`[Job ${job.id}] Build completed successfully!`);
+    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Build completed successfully.' }));
 
-  } catch (error) {
+  } catch (error: any) {
     await prisma.build.update({
       where: { id: buildId },
       data: { status: 'FAILED', completedAt: new Date() }
     });
     console.error(`[Job ${job.id}] Failed:`, error);
+    const channel = `build-logs:${buildId}`;
+    publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build failed: ${error.message}` }));
     throw error;
   } finally {
     // 11. The Ironclad Cleanup Block
