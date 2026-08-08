@@ -9,6 +9,7 @@ import simpleGit from 'simple-git';
 import fs from 'fs/promises';
 import path from 'path';
 import yaml from 'js-yaml';
+import { PassThrough } from 'stream';
 
 dotenv.config();
 
@@ -114,13 +115,52 @@ const worker = new Worker('build-queue', async (job: Job) => {
       },
     });
 
-    console.log(`[Job ${job.id}] Container created (Execution comes next).`);
+    // 6. Start the Container
+    console.log(`[Job ${job.id}] Starting container execution...`);
+    await container.start();
 
-    // Mark as SUCCESS (temporary until execution is added)
+    // 7. Demultiplex Logs (Properly separating stdout and stderr)
+    const logStream = await container.logs({ follow: true, stdout: true, stderr: true });
+    
+    const stdoutStream = new PassThrough();
+    const stderrStream = new PassThrough();
+
+    stdoutStream.on('data', (chunk) => console.log(`[Job ${job.id} INFO] ${chunk.toString('utf8').trim()}`));
+    stderrStream.on('data', (chunk) => console.log(`[Job ${job.id} ERR]  ${chunk.toString('utf8').trim()}`));
+
+    container.modem.demuxStream(logStream, stdoutStream, stderrStream);
+
+    // 8. Wait for Exit with a Hard Timeout
+    const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes maximum
+    let exitCode: number;
+
+    try {
+      exitCode = await Promise.race([
+        container.wait().then(data => data.StatusCode),
+        new Promise<number>((_, reject) => 
+          setTimeout(async () => {
+            console.log(`[Job ${job.id}] Timeout reached! Killing container...`);
+            await container.kill(); 
+            reject(new Error('Build timed out after 10 minutes'));
+          }, TIMEOUT_MS)
+        )
+      ]);
+    } finally {
+      // 9. Clean up the container from Docker Engine
+      console.log(`[Job ${job.id}] Removing container from host...`);
+      await container.remove({ force: true });
+    }
+
+    if (exitCode !== 0) {
+      throw new Error(`Build failed with exit code ${exitCode}`);
+    }
+
+    // 10. Mark Success in PostgreSQL
     await prisma.build.update({
       where: { id: buildId },
       data: { status: 'SUCCESS', completedAt: new Date() }
     });
+    console.log(`[Job ${job.id}] Build completed successfully!`);
 
   } catch (error) {
     await prisma.build.update({
@@ -130,6 +170,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     console.error(`[Job ${job.id}] Failed:`, error);
     throw error;
   } finally {
+    // 11. The Ironclad Cleanup Block
     try {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       console.log(`[Job ${job.id}] Cleaned up workspace.`);
