@@ -1,0 +1,98 @@
+import React, { useEffect, useRef } from 'react';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import { io, Socket } from 'socket.io-client';
+import '@xterm/xterm/css/xterm.css';
+
+interface TerminalViewerProps {
+  buildId: string;
+  onStatusChange?: (status: string) => void;
+}
+
+export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, onStatusChange }) => {
+  const terminalRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!terminalRef.current || !buildId) return;
+
+    // 1. Initialize Terminal instance
+    const term = new Terminal({
+      theme: {
+        background: '#0d1117',
+        foreground: '#c9d1d9',
+        cursor: '#58a6ff',
+      },
+      fontFamily: 'ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace',
+      fontSize: 13,
+      lineHeight: 1.4,
+      disableStdin: true,
+      cursorBlink: true,
+    });
+
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(terminalRef.current);
+    
+    // Ensure container dimensions are calculated before fitting
+    setTimeout(() => {
+      fitAddon.fit();
+    }, 50);
+
+    term.writeln('\x1b[33m[SYSTEM] Initializing stream pipeline...\x1b[0m\r');
+
+    // 2. Establish WebSocket Connection
+    const token = localStorage.getItem('token');
+    const socket: Socket = io('http://localhost:3000', {
+      auth: { token: `Bearer ${token}` }
+    });
+
+    socket.on('connect', () => {
+      term.writeln('\x1b[32m[SYSTEM] Connected to WebSocket gateway.\x1b[0m\r');
+      term.writeln(`\x1b[36m[SYSTEM] Subscribing to build ID: ${buildId}\x1b[0m\r\n`);
+      
+      if (onStatusChange) onStatusChange('STREAMING');
+      
+      socket.emit('subscribeToBuild', buildId);
+    });
+
+    // 3. Process Inbound Log Chunks
+    socket.on('build-log', (data: { type: string; text: string }) => {
+      // Normalize lines to ensure carriage returns for canvas positioning
+      const formattedText = data.text.replace(/\r?\n/g, '\r\n');
+
+      if (data.type === 'error') {
+        term.writeln(`\x1b[31m${formattedText}\x1b[0m\r`);
+      } else if (data.type === 'system') {
+        term.writeln(`\r\n\x1b[35m[SYSTEM EVENT] ${formattedText}\x1b[0m\r\n`);
+        if (onStatusChange) {
+          if (formattedText.includes('completed')) onStatusChange('SUCCESS');
+          if (formattedText.includes('failed')) onStatusChange('FAILED');
+        }
+      } else {
+        term.writeln(`${formattedText}\r`);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      term.writeln('\r\n\x1b[31m[SYSTEM] Connection terminated.\x1b[0m\r');
+      if (onStatusChange) onStatusChange('DISCONNECTED');
+    });
+
+    // Handle viewport adjustments
+    const handleResize = () => fitAddon.fit();
+    window.addEventListener('resize', handleResize);
+
+    // 4. Memory Leak Prevention / Cleanup
+    return () => {
+      socket.disconnect();
+      window.removeEventListener('resize', handleResize);
+      term.dispose();
+    };
+  }, [buildId]);
+
+  return (
+    <div className="w-full h-full p-2 bg-[#0d1117] rounded-lg overflow-hidden border border-gray-800 shadow-inner">
+      <div ref={terminalRef} className="w-full h-full" />
+    </div>
+  );
+};
