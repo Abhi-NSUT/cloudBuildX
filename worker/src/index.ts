@@ -57,6 +57,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
   // Define a unique, absolute path for this specific build
   const workspaceDir = path.resolve(__dirname, '../../tmp-workspaces', buildId);
   const logFilePath = path.resolve(__dirname, '../../tmp-workspaces', `${buildId}.log`);
+  let logFileStream: fsSync.WriteStream | null = null;
 
   console.log(`\n[${WORKER_ID}] Picked up build: ${buildId} (Job ${job.id})`);
 
@@ -156,14 +157,14 @@ const worker = new Worker('build-queue', async (job: Job) => {
     const channel = `build-logs:${buildId}`;
     
     // Create a write stream for the historical log file
-    const logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
+    logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
 
     stdoutStream.on('data', async (chunk) => {
       const text = chunk.toString('utf8').trim();
       if (text) {
         console.log(`[Job ${job.id} INFO] ${text}`);
         publisher.publish(channel, JSON.stringify({ type: 'info', text }));
-        logFileStream.write(`${text}\r\n`);
+        if (logFileStream) logFileStream.write(`${text}\r\n`);
         await job.updateProgress(50); // Explicit heartbeat
       }
     });
@@ -174,7 +175,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
         console.log(`[Job ${job.id} ERR]  ${text}`);
         publisher.publish(channel, JSON.stringify({ type: 'error', text }));
         // Add ANSI red formatting for errors in the log file
-        logFileStream.write(`\x1b[31m${text}\x1b[0m\r\n`);
+        if (logFileStream) logFileStream.write(`\x1b[31m${text}\x1b[0m\r\n`);
         await job.updateProgress(50); // Explicit heartbeat
       }
     });
@@ -232,23 +233,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
 
     await upload.done();
     
-    // 9.6 Upload Log File to MinIO
-    console.log(`[Job ${job.id}] Uploading historical logs to MinIO...`);
-    logFileStream.end();
-    
-    const logUpload = new Upload({
-      client: s3Client,
-      params: {
-        Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
-        Key: `builds/${buildId}.log`,
-        Body: fsSync.createReadStream(logFilePath),
-        ContentType: 'text/plain'
-      }
-    });
-    await logUpload.done();
-
-    console.log(`[Job ${job.id}] Artifacts and logs uploaded successfully.`);
-    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts and logs uploaded successfully.' }));
+    console.log(`[Job ${job.id}] Artifacts uploaded successfully.`);
+    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts uploaded successfully.' }));
 
     // 10. Mark Success in PostgreSQL
     await prisma.build.update({
@@ -266,9 +252,31 @@ const worker = new Worker('build-queue', async (job: Job) => {
     console.error(`[Job ${job.id}] Failed:`, error);
     const channel = `build-logs:${buildId}`;
     publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build failed: ${error.message}` }));
+    if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build failed: ${error.message}\x1b[0m\r\n`);
     throw error;
   } finally {
-    // 11. The Ironclad Cleanup Block
+    // 11. Upload Historical Logs & Clean Up
+    try {
+      if (logFileStream) {
+        console.log(`[Job ${job.id}] Uploading historical logs to MinIO...`);
+        logFileStream.end();
+        
+        const logUpload = new Upload({
+          client: s3Client,
+          params: {
+            Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
+            Key: `builds/${buildId}.log`,
+            Body: fsSync.createReadStream(logFilePath),
+            ContentType: 'text/plain'
+          }
+        });
+        await logUpload.done();
+        console.log(`[Job ${job.id}] Historical logs uploaded successfully.`);
+      }
+    } catch (uploadErr) {
+      console.error(`[Job ${job.id}] Failed to upload historical logs:`, uploadErr);
+    }
+
     try {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       await fs.rm(logFilePath, { force: true });

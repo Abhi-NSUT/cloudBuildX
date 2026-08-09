@@ -42,7 +42,12 @@ export const createBuild = async (req: AuthRequest, res: Response) => {
       repositoryUrl: repo.githubUrl,
       commitHash: build.commitHash
     }, {
-      attempts: 1
+      attempts: 3, // Try up to 3 times
+      backoff: {
+        type: 'exponential',
+        delay: 5000, // Wait 5s, then 25s, etc.
+      },
+      removeOnComplete: true,
     });
 
     return res.status(201).json({
