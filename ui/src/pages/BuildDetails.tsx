@@ -118,7 +118,13 @@ export const BuildDetails: React.FC = () => {
           <div className="text-gray-400 text-xs font-mono ml-4 flex-grow text-center">console output - bash</div>
         </div>
         <div className="flex-grow relative p-2">
-          <TerminalViewer buildId={buildId} onStatusChange={setStreamStatus} />
+          {build && (
+            <TerminalViewer 
+              buildId={buildId} 
+              initialStatus={build.status} 
+              onStatusChange={setStreamStatus} 
+            />
+          )}
         </div>
       </div>
     </div>

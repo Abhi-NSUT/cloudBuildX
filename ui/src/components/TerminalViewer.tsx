@@ -2,14 +2,16 @@ import React, { useEffect, useRef } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { io, Socket } from 'socket.io-client';
+import axios from 'axios';
 import '@xterm/xterm/css/xterm.css';
 
 interface TerminalViewerProps {
   buildId: string;
+  initialStatus: string;
   onStatusChange?: (status: string) => void;
 }
 
-export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, onStatusChange }) => {
+export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initialStatus, onStatusChange }) => {
   const terminalRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -38,10 +40,40 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, onStatu
       fitAddon.fit();
     }, 50);
 
-    term.writeln('\x1b[33m[SYSTEM] Initializing stream pipeline...\x1b[0m\r');
-
-    // 2. Establish WebSocket Connection
     const token = localStorage.getItem('token');
+
+    if (initialStatus === 'SUCCESS' || initialStatus === 'FAILED') {
+      // Fetch historical logs
+      term.writeln('\x1b[33m[SYSTEM] Fetching historical logs...\x1b[0m\r');
+      if (onStatusChange) onStatusChange('COMPLETED');
+      
+      axios.get(`http://localhost:3000/api/builds/${buildId}/logs`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      .then(res => {
+        // Write the raw text directly to the terminal
+        term.writeln('');
+        // Ensure all newlines are \r\n for xterm formatting
+        term.write(res.data.replace(/\r?\n/g, '\r\n'));
+        term.writeln('\r\n\x1b[32m[SYSTEM] Historical log loaded.\x1b[0m\r');
+      })
+      .catch(err => {
+        term.writeln(`\r\n\x1b[31m[SYSTEM] Failed to load historical logs: ${err.response?.data?.error || err.message}\x1b[0m\r`);
+      });
+
+      // Handle viewport adjustments
+      const handleResize = () => fitAddon.fit();
+      window.addEventListener('resize', handleResize);
+
+      return () => {
+        window.removeEventListener('resize', handleResize);
+        term.dispose();
+      };
+    }
+
+    // Otherwise, establish WebSocket Connection for live streaming
+    term.writeln('\x1b[33m[SYSTEM] Initializing stream pipeline...\x1b[0m\r');
+    
     const socket: Socket = io('http://localhost:3000', {
       auth: { token: `Bearer ${token}` }
     });

@@ -13,6 +13,7 @@ import { PassThrough } from 'stream';
 import { S3Client } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import archiver = require('archiver');
+import * as fsSync from 'fs';
 
 dotenv.config();
 
@@ -52,6 +53,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
   
   // Define a unique, absolute path for this specific build
   const workspaceDir = path.resolve(__dirname, '../../tmp-workspaces', buildId);
+  const logFilePath = path.resolve(__dirname, '../../tmp-workspaces', `${buildId}.log`);
 
   console.log(`\n[Job ${job.id}] Picked up build: ${buildId}`);
 
@@ -144,12 +146,16 @@ const worker = new Worker('build-queue', async (job: Job) => {
     const stderrStream = new PassThrough();
 
     const channel = `build-logs:${buildId}`;
+    
+    // Create a write stream for the historical log file
+    const logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
 
     stdoutStream.on('data', (chunk) => {
       const text = chunk.toString('utf8').trim();
       if (text) {
         console.log(`[Job ${job.id} INFO] ${text}`);
         publisher.publish(channel, JSON.stringify({ type: 'info', text }));
+        logFileStream.write(`${text}\r\n`);
       }
     });
 
@@ -158,6 +164,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
       if (text) {
         console.log(`[Job ${job.id} ERR]  ${text}`);
         publisher.publish(channel, JSON.stringify({ type: 'error', text }));
+        // Add ANSI red formatting for errors in the log file
+        logFileStream.write(`\x1b[31m${text}\x1b[0m\r\n`);
       }
     });
 
@@ -185,12 +193,14 @@ const worker = new Worker('build-queue', async (job: Job) => {
     }
 
     if (exitCode !== 0) {
+      logFileStream.end();
       throw new Error(`Build failed with exit code ${exitCode}`);
     }
 
     // 9.5 Zip and Upload Artifacts to MinIO
     console.log(`[Job ${job.id}] Zipping artifacts and uploading to MinIO...`);
     publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Compressing and uploading artifacts...' }));
+    logFileStream.write(`\r\n\x1b[35m[SYSTEM EVENT] Compressing and uploading artifacts...\x1b[0m\r\n`);
     
     const archive = new (archiver as any).ZipArchive({ zlib: { level: 9 } });
     const pass = new PassThrough();
@@ -211,8 +221,24 @@ const worker = new Worker('build-queue', async (job: Job) => {
     archive.finalize();
 
     await upload.done();
-    console.log(`[Job ${job.id}] Artifacts uploaded successfully.`);
-    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts uploaded successfully.' }));
+    
+    // 9.6 Upload Log File to MinIO
+    console.log(`[Job ${job.id}] Uploading historical logs to MinIO...`);
+    logFileStream.end();
+    
+    const logUpload = new Upload({
+      client: s3Client,
+      params: {
+        Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
+        Key: `builds/${buildId}.log`,
+        Body: fsSync.createReadStream(logFilePath),
+        ContentType: 'text/plain'
+      }
+    });
+    await logUpload.done();
+
+    console.log(`[Job ${job.id}] Artifacts and logs uploaded successfully.`);
+    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts and logs uploaded successfully.' }));
 
     // 10. Mark Success in PostgreSQL
     await prisma.build.update({
@@ -235,7 +261,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
     // 11. The Ironclad Cleanup Block
     try {
       await fs.rm(workspaceDir, { recursive: true, force: true });
-      console.log(`[Job ${job.id}] Cleaned up workspace.`);
+      await fs.rm(logFilePath, { force: true });
+      console.log(`[Job ${job.id}] Cleaned up workspace and local logs.`);
     } catch (cleanupErr) {
       console.error(`[Job ${job.id}] FATAL: Failed to clean up workspace:`, cleanupErr);
     }

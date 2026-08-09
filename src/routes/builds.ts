@@ -153,3 +153,47 @@ export const getBuildArtifact = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ error: 'Failed to generate download link' });
   }
 };
+
+// GET /api/builds/:id/logs - Fetch the historical log file for a completed build
+export const getBuildLogs = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user?.id;
+
+    const build = await prisma.build.findUnique({
+      where: { id },
+      include: { repository: true }
+    });
+
+    if (!build) return res.status(404).json({ error: 'Build not found' });
+    if (build.repository.userId !== userId) return res.status(403).json({ error: 'Unauthorized access' });
+
+    if (build.status === 'PENDING' || build.status === 'RUNNING') {
+      return res.status(400).json({ error: 'Logs are still streaming. Please connect via WebSockets.' });
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
+      Key: `builds/${id}.log`
+    });
+
+    try {
+      const s3Response = await s3Client.send(command);
+      
+      // The body is a Readable stream in Node.js
+      const stream = s3Response.Body as any;
+      
+      res.setHeader('Content-Type', 'text/plain');
+      stream.pipe(res);
+      
+    } catch (s3Error: any) {
+      if (s3Error.name === 'NoSuchKey') {
+        return res.status(404).json({ error: 'Log file not found in storage. It may have been deleted.' });
+      }
+      throw s3Error;
+    }
+  } catch (error) {
+    console.error('Error fetching build logs:', error);
+    return res.status(500).json({ error: 'Failed to fetch build logs' });
+  }
+};
