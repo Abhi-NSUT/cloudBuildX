@@ -4,6 +4,7 @@ import { AuthRequest } from '../middleware/auth';
 import { buildQueue } from '../queue';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import IORedis from 'ioredis';
 
 const s3Client = new S3Client({
   region: 'us-east-1',
@@ -200,5 +201,43 @@ export const getBuildLogs = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Error fetching build logs:', error);
     return res.status(500).json({ error: 'Failed to fetch build logs' });
+  }
+};
+
+// POST /api/builds/:id/cancel
+export const cancelBuild = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user?.id;
+
+    const build = await prisma.build.findUnique({
+      where: { id },
+      include: { repository: true }
+    });
+
+    if (!build) return res.status(404).json({ error: 'Build not found' });
+    if (build.repository.userId !== userId) return res.status(403).json({ error: 'Unauthorized' });
+    
+    if (build.status === 'SUCCESS' || build.status === 'FAILED' || build.status === 'CANCELLED') {
+      return res.status(400).json({ error: 'Build is already finished' });
+    }
+
+    // 1. Update the database immediately
+    await prisma.build.update({
+      where: { id },
+      data: { status: 'CANCELLED', completedAt: new Date() }
+    });
+
+    // 2. Broadcast the kill signal to the workers
+    const redisPublisher = new IORedis({ 
+      host: process.env.REDIS_HOST || '127.0.0.1', 
+      port: Number(process.env.REDIS_PORT) || 6379 
+    });
+    await redisPublisher.publish(`cancel-build`, id);
+
+    return res.status(200).json({ message: 'Cancellation requested' });
+  } catch (error) {
+    console.error('Error canceling build:', error);
+    return res.status(500).json({ error: 'Failed to cancel build' });
   }
 };
