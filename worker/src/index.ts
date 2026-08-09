@@ -14,6 +14,7 @@ import { S3Client } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import archiver = require('archiver');
 import * as fsSync from 'fs';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -46,7 +47,9 @@ const publisher = new IORedis({
 
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
-log('Worker is listening for jobs on "build-queue"...');
+const WORKER_ID = `worker-${crypto.randomBytes(4).toString('hex')}`;
+console.log(`🚀 Starting Node: ${WORKER_ID}`);
+log(`Worker is listening for jobs on "build-queue"...`);
 
 const worker = new Worker('build-queue', async (job: Job) => {
   const { buildId, repositoryUrl, commitHash } = job.data;
@@ -55,16 +58,21 @@ const worker = new Worker('build-queue', async (job: Job) => {
   const workspaceDir = path.resolve(__dirname, '../../tmp-workspaces', buildId);
   const logFilePath = path.resolve(__dirname, '../../tmp-workspaces', `${buildId}.log`);
 
-  console.log(`\n[Job ${job.id}] Picked up build: ${buildId}`);
+  console.log(`\n[${WORKER_ID}] Picked up build: ${buildId} (Job ${job.id})`);
 
   try {
     await prisma.build.update({
       where: { id: buildId },
-      data: { status: 'RUNNING', startedAt: new Date() }
+      data: { status: 'RUNNING', startedAt: new Date(), workerNode: WORKER_ID }
     });
 
+    publisher.publish(`build-logs:${buildId}`, JSON.stringify({ 
+      type: 'system', 
+      text: `Job claimed by ${WORKER_ID}. Starting execution...` 
+    }));
+
     // 1. Ensure a clean slate (Forcefully remove ghost directories)
-    console.log(`[Job ${job.id}] Initializing workspace...`);
+    console.log(`[${WORKER_ID}] Initializing workspace...`);
     try {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     } catch (e) { /* Ignore if it doesn't exist */ }
@@ -150,22 +158,24 @@ const worker = new Worker('build-queue', async (job: Job) => {
     // Create a write stream for the historical log file
     const logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
 
-    stdoutStream.on('data', (chunk) => {
+    stdoutStream.on('data', async (chunk) => {
       const text = chunk.toString('utf8').trim();
       if (text) {
         console.log(`[Job ${job.id} INFO] ${text}`);
         publisher.publish(channel, JSON.stringify({ type: 'info', text }));
         logFileStream.write(`${text}\r\n`);
+        await job.updateProgress(50); // Explicit heartbeat
       }
     });
 
-    stderrStream.on('data', (chunk) => {
+    stderrStream.on('data', async (chunk) => {
       const text = chunk.toString('utf8').trim();
       if (text) {
         console.log(`[Job ${job.id} ERR]  ${text}`);
         publisher.publish(channel, JSON.stringify({ type: 'error', text }));
         // Add ANSI red formatting for errors in the log file
         logFileStream.write(`\x1b[31m${text}\x1b[0m\r\n`);
+        await job.updateProgress(50); // Explicit heartbeat
       }
     });
 
@@ -267,4 +277,40 @@ const worker = new Worker('build-queue', async (job: Job) => {
       console.error(`[Job ${job.id}] FATAL: Failed to clean up workspace:`, cleanupErr);
     }
   }
-}, { connection, concurrency: 2 });
+}, { 
+  connection, 
+  concurrency: 1, 
+  lockDuration: 30000, 
+  stalledInterval: 30000 
+});
+
+worker.on('failed', (job, err) => {
+  console.error(`[${WORKER_ID}] Job ${job?.id} failed:`, err.message);
+});
+
+worker.on('completed', (job) => {
+  console.log(`[${WORKER_ID}] Job ${job.id} completed successfully.`);
+});
+
+worker.on('stalled', (jobId) => {
+  console.warn(`[${WORKER_ID}] ⚠️ Warning: Job ${jobId} stalled. A worker likely crashed. BullMQ is re-queueing it for another node.`);
+});
+
+// Graceful Shutdown Implementation
+const shutdown = async (signal: string) => {
+  console.log(`\n[${WORKER_ID}] Received ${signal}. Initiating graceful shutdown...`);
+  
+  await worker.close(); // Stop accepting new jobs
+  console.log(`[${WORKER_ID}] Waiting for active jobs to finish...`);
+  
+  await worker.disconnect(); 
+  await prisma.$disconnect();
+  publisher.quit();
+  connection.quit();
+  
+  console.log(`[${WORKER_ID}] Shutdown complete. Goodbye.`);
+  process.exit(0);
+};
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
