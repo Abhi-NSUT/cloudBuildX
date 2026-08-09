@@ -222,6 +222,11 @@ export const cancelBuild = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Build is already finished' });
     }
 
+    const timeSinceCreation = Date.now() - new Date(build.createdAt).getTime();
+    if (timeSinceCreation > 15000) {
+      return res.status(400).json({ error: 'Cancellation is only allowed within the first 15 seconds' });
+    }
+
     // 1. Update the database immediately
     await prisma.build.update({
       where: { id },

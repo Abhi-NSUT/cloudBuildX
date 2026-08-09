@@ -20,6 +20,25 @@ export const BuildDetails: React.FC = () => {
   const { buildId } = useParams<{ buildId: string }>();
   const [build, setBuild] = useState<BuildDetail | null>(null);
   const [streamStatus, setStreamStatus] = useState('CONNECTING');
+  const [isCancelable, setIsCancelable] = useState(true);
+
+  // Disable cancellation after 15 seconds
+  useEffect(() => {
+    if (!build?.createdAt) return;
+    
+    const checkCancelable = () => {
+      const createdTime = new Date(build.createdAt).getTime();
+      if (Date.now() - createdTime > 15000) {
+        setIsCancelable(false);
+      } else {
+        setIsCancelable(true);
+      }
+    };
+
+    checkCancelable();
+    const interval = setInterval(checkCancelable, 1000);
+    return () => clearInterval(interval);
+  }, [build?.createdAt]);
 
   const handleDownloadArtifact = async () => {
     try {
@@ -30,6 +49,20 @@ export const BuildDetails: React.FC = () => {
       window.location.href = res.data.url;
     } catch (err) {
       alert('Artifact not found or expired.');
+    }
+  };
+
+  const handleCancelBuild = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      await axios.post(`http://localhost:3000/api/builds/${buildId}/cancel`, {}, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      // We don't need to manually update state here because the WebSocket will 
+      // broadcast the cancellation and the UI will update dynamically!
+    } catch (err: any) {
+      alert(err.response?.data?.error || 'Failed to cancel build.');
+      console.error(err);
     }
   };
 
@@ -101,14 +134,30 @@ export const BuildDetails: React.FC = () => {
           </div>
         </div>
         <div>
-          <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Artifact</div>
+          <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Actions</div>
           <div className="font-medium">
             {build?.status === 'SUCCESS' ? (
               <button onClick={handleDownloadArtifact} className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1 rounded shadow">
                 Download .ZIP
               </button>
+            ) : build?.status === 'RUNNING' || build?.status === 'QUEUED' ? (
+              <button 
+                onClick={handleCancelBuild} 
+                disabled={!isCancelable}
+                title={!isCancelable ? "Cancellation is only allowed within the first 15 seconds" : "Cancel Build"}
+                className={`text-sm px-3 py-1 rounded shadow flex items-center gap-1 transition-colors text-white ${
+                  isCancelable 
+                    ? 'bg-red-500 hover:bg-red-600' 
+                    : 'bg-gray-400 cursor-not-allowed opacity-70'
+                }`}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
+                </svg>
+                Stop Build
+              </button>
             ) : (
-              <span className="text-sm text-gray-400">Unavailable</span>
+              <span className="text-sm text-gray-400">No actions available</span>
             )}
           </div>
         </div>
