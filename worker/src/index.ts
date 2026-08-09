@@ -51,19 +51,23 @@ const subscriber = new IORedis({
 });
 
 const activeContainers = new Map<string, Docker.Container>();
+const activeJobs = new Set<string>();
 const cancelledBuilds = new Set<string>();
 
 subscriber.subscribe('cancel-build');
 subscriber.on('message', async (channel, buildId) => {
   if (channel === 'cancel-build') {
-    if (activeContainers.has(buildId)) {
-      console.log(`[Worker ${WORKER_ID}] Kill signal received for build ${buildId}! Terminating...`);
+    if (activeJobs.has(buildId)) {
+      console.log(`[Worker ${WORKER_ID}] Cancel signal received for build ${buildId}!`);
       cancelledBuilds.add(buildId);
-      const container = activeContainers.get(buildId);
-      try {
-        await container?.kill();
-      } catch (e) {
-        console.error(`[Worker ${WORKER_ID}] Error killing container for build ${buildId}:`, e);
+      
+      if (activeContainers.has(buildId)) {
+        const container = activeContainers.get(buildId);
+        try {
+          await container?.kill();
+        } catch (e) {
+          console.error(`[Worker ${WORKER_ID}] Error killing container for build ${buildId}:`, e);
+        }
       }
     }
   }
@@ -84,17 +88,20 @@ const worker = new Worker('build-queue', async (job: Job) => {
   let logFileStream: fsSync.WriteStream | null = null;
 
   console.log(`\n[${WORKER_ID}] Picked up build: ${buildId} (Job ${job.id})`);
+  activeJobs.add(buildId);
 
   try {
+    // Create a write stream for the historical log file right at the start
+    logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
+
     await prisma.build.update({
       where: { id: buildId },
       data: { status: 'RUNNING', startedAt: new Date(), workerNode: WORKER_ID }
     });
 
-    publisher.publish(`build-logs:${buildId}`, JSON.stringify({ 
-      type: 'system', 
-      text: `Job claimed by ${WORKER_ID}. Starting execution...` 
-    }));
+    const initMsg = `Job claimed by ${WORKER_ID}. Starting execution...`;
+    publisher.publish(`build-logs:${buildId}`, JSON.stringify({ type: 'system', text: initMsg }));
+    logFileStream.write(`${initMsg}\r\n`);
 
     // 1. Ensure a clean slate (Forcefully remove ghost directories)
     console.log(`[${WORKER_ID}] Initializing workspace...`);
@@ -170,6 +177,13 @@ const worker = new Worker('build-queue', async (job: Job) => {
 
     activeContainers.set(buildId, container);
 
+    // Check if we were cancelled while the container was being created or image pulled
+    if (cancelledBuilds.has(buildId)) {
+      await container.remove({ force: true }).catch(() => {});
+      activeContainers.delete(buildId);
+      throw new Error('BUILD_CANCELLED');
+    }
+
     // 6. Start the Container
     console.log(`[Job ${job.id}] Starting container execution...`);
     await container.start();
@@ -181,9 +195,6 @@ const worker = new Worker('build-queue', async (job: Job) => {
     const stderrStream = new PassThrough();
 
     const channel = `build-logs:${buildId}`;
-    
-    // Create a write stream for the historical log file
-    logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
 
     stdoutStream.on('data', async (chunk) => {
       const text = chunk.toString('utf8').trim();
@@ -226,7 +237,10 @@ const worker = new Worker('build-queue', async (job: Job) => {
     } finally {
       // 9. Clean up the container from Docker Engine
       console.log(`[Job ${job.id}] Removing container from host...`);
-      await container.remove({ force: true });
+      // We remove it from activeContainers here so that we don't try to kill it 
+      // if a cancel signal arrives during the artifact zipping phase!
+      activeContainers.delete(buildId);
+      await container.remove({ force: true }).catch(() => {});
     }
 
     if (exitCode !== 0) {
@@ -270,7 +284,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Build completed successfully.' }));
 
   } catch (error: any) {
-    if (cancelledBuilds.has(buildId)) {
+    if (cancelledBuilds.has(buildId) || error.message === 'BUILD_CANCELLED') {
       console.error(`[Job ${job.id}] Build was cancelled by user.`);
       const channel = `build-logs:${buildId}`;
       publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build cancelled by user.` }));
@@ -287,10 +301,9 @@ const worker = new Worker('build-queue', async (job: Job) => {
       throw error;
     }
   } finally {
-    activeContainers.delete(buildId);
+    activeJobs.delete(buildId);
     cancelledBuilds.delete(buildId);
-    
-    // 11. Upload Historical Logs & Clean Up
+    // Cleanup workspaces
     try {
       if (logFileStream) {
         console.log(`[Job ${job.id}] Uploading historical logs to MinIO...`);
@@ -302,8 +315,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
             Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
             Key: `builds/${buildId}.log`,
             Body: fsSync.createReadStream(logFilePath),
-            ContentType: 'text/plain'
-          }
+            ContentType: 'text/plain',
+          },
         });
         await logUpload.done();
         console.log(`[Job ${job.id}] Historical logs uploaded successfully.`);
