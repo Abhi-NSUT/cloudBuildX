@@ -9,6 +9,7 @@ interface BuildDetail {
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+  workerNode?: string;
   repository: {
     name: string;
     githubUrl: string;
@@ -63,7 +64,7 @@ export const BuildDetails: React.FC = () => {
       </div>
 
       {/* Details Bar */}
-      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 grid grid-cols-5 gap-6">
+      <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 grid grid-cols-6 gap-6">
         <div>
           <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Build ID</div>
           <div className="font-mono text-sm text-gray-800">{buildId}</div>
@@ -91,6 +92,12 @@ export const BuildDetails: React.FC = () => {
             }`}>
               {build?.status || 'UNKNOWN'}
             </span>
+          </div>
+        </div>
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Execution Node</div>
+          <div className="font-mono text-sm text-gray-800">
+            {build?.workerNode || 'Queued...'}
           </div>
         </div>
         <div>
