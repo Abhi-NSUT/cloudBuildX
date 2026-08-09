@@ -82,7 +82,7 @@ export const BuildDetails: React.FC = () => {
           </div>
         </div>
         <div>
-          <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Initial Status</div>
+          <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Status</div>
           <div className="font-medium">
             <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
               build?.status === 'SUCCESS' ? 'bg-green-100 text-green-800' :
@@ -129,7 +129,8 @@ export const BuildDetails: React.FC = () => {
             <TerminalViewer 
               buildId={buildId} 
               initialStatus={build.status} 
-              onStatusChange={setStreamStatus} 
+              onStatusChange={setStreamStatus}
+              onBuildComplete={(newStatus) => setBuild(prev => prev ? { ...prev, status: newStatus } : prev)}
             />
           )}
         </div>

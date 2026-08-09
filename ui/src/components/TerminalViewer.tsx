@@ -9,9 +9,10 @@ interface TerminalViewerProps {
   buildId: string;
   initialStatus: string;
   onStatusChange?: (status: string) => void;
+  onBuildComplete?: (status: string) => void;
 }
 
-export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initialStatus, onStatusChange }) => {
+export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initialStatus, onStatusChange, onBuildComplete }) => {
   const terminalRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -42,7 +43,7 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
 
     const token = localStorage.getItem('token');
 
-    if (initialStatus === 'SUCCESS' || initialStatus === 'FAILED') {
+    if (initialStatus === 'SUCCESS' || initialStatus === 'FAILED' || initialStatus === 'CANCELLED') {
       // Fetch historical logs
       term.writeln('\x1b[33m[SYSTEM] Fetching historical logs...\x1b[0m\r');
       if (onStatusChange) onStatusChange('COMPLETED');
@@ -96,9 +97,15 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
         term.writeln(`\x1b[31m${formattedText}\x1b[0m\r`);
       } else if (data.type === 'system') {
         term.writeln(`\r\n\x1b[35m[SYSTEM EVENT] ${formattedText}\x1b[0m\r\n`);
-        if (onStatusChange) {
-          if (formattedText.includes('completed')) onStatusChange('SUCCESS');
-          if (formattedText.includes('failed')) onStatusChange('FAILED');
+        
+        let finalStatus: string | null = null;
+        if (formattedText.includes('completed')) finalStatus = 'SUCCESS';
+        else if (formattedText.includes('cancelled')) finalStatus = 'CANCELLED';
+        else if (formattedText.includes('failed')) finalStatus = 'FAILED';
+
+        if (finalStatus) {
+          if (onStatusChange) onStatusChange(finalStatus);
+          if (onBuildComplete) onBuildComplete(finalStatus);
         }
       } else {
         term.writeln(`${formattedText}\r`);

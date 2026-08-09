@@ -45,6 +45,30 @@ const publisher = new IORedis({
   port: Number(process.env.REDIS_PORT) || 6379,
 });
 
+const subscriber = new IORedis({
+  host: process.env.REDIS_HOST || '127.0.0.1',
+  port: Number(process.env.REDIS_PORT) || 6379,
+});
+
+const activeContainers = new Map<string, Docker.Container>();
+const cancelledBuilds = new Set<string>();
+
+subscriber.subscribe('cancel-build');
+subscriber.on('message', async (channel, buildId) => {
+  if (channel === 'cancel-build') {
+    if (activeContainers.has(buildId)) {
+      console.log(`[Worker ${WORKER_ID}] Kill signal received for build ${buildId}! Terminating...`);
+      cancelledBuilds.add(buildId);
+      const container = activeContainers.get(buildId);
+      try {
+        await container?.kill();
+      } catch (e) {
+        console.error(`[Worker ${WORKER_ID}] Error killing container for build ${buildId}:`, e);
+      }
+    }
+  }
+});
+
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
 const WORKER_ID = `worker-${crypto.randomBytes(4).toString('hex')}`;
@@ -127,7 +151,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     });
     console.log(`[Job ${job.id}] Image pulled successfully.`);
 
-    // 5. Create the Container with Security Constraints
+    // 5. Create & Start the Container
     console.log(`[Job ${job.id}] Creating isolated container...`);
     const shellCmd = config.commands.join(' && ');
 
@@ -143,6 +167,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
         AutoRemove: false, // We must fetch the exit code first
       },
     });
+
+    activeContainers.set(buildId, container);
 
     // 6. Start the Container
     console.log(`[Job ${job.id}] Starting container execution...`);
@@ -204,7 +230,6 @@ const worker = new Worker('build-queue', async (job: Job) => {
     }
 
     if (exitCode !== 0) {
-      logFileStream.end();
       throw new Error(`Build failed with exit code ${exitCode}`);
     }
 
@@ -245,16 +270,26 @@ const worker = new Worker('build-queue', async (job: Job) => {
     publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Build completed successfully.' }));
 
   } catch (error: any) {
-    await prisma.build.update({
-      where: { id: buildId },
-      data: { status: 'FAILED', completedAt: new Date() }
-    });
-    console.error(`[Job ${job.id}] Failed:`, error);
-    const channel = `build-logs:${buildId}`;
-    publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build failed: ${error.message}` }));
-    if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build failed: ${error.message}\x1b[0m\r\n`);
-    throw error;
+    if (cancelledBuilds.has(buildId)) {
+      console.error(`[Job ${job.id}] Build was cancelled by user.`);
+      const channel = `build-logs:${buildId}`;
+      publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build cancelled by user.` }));
+      if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build cancelled by user.\x1b[0m\r\n`);
+    } else {
+      await prisma.build.update({
+        where: { id: buildId },
+        data: { status: 'FAILED', completedAt: new Date() }
+      });
+      console.error(`[Job ${job.id}] Failed:`, error);
+      const channel = `build-logs:${buildId}`;
+      publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build failed: ${error.message}` }));
+      if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build failed: ${error.message}\x1b[0m\r\n`);
+      throw error;
+    }
   } finally {
+    activeContainers.delete(buildId);
+    cancelledBuilds.delete(buildId);
+    
     // 11. Upload Historical Logs & Clean Up
     try {
       if (logFileStream) {
