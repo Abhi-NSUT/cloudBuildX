@@ -1,8 +1,7 @@
 module.exports = {
   apps: [{
     name: "cloudbuildx-worker",
-    script: "node_modules/.bin/tsx",
-    args: "src/index.ts",
+    script: "dist/index.js",
     instances: 3,
     exec_mode: "cluster",
     env: {
