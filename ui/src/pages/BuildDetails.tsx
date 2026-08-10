@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import axios from 'axios';
 import { TerminalViewer } from '../components/TerminalViewer';
+import { API_URL } from '../config';
 
 interface BuildDetail {
   id: string;
@@ -43,7 +44,7 @@ export const BuildDetails: React.FC = () => {
   const handleDownloadArtifact = async () => {
     try {
       const token = localStorage.getItem('token');
-      const res = await axios.get(`http://localhost:3000/api/builds/${buildId}/artifact`, {
+      const res = await axios.get(`${API_URL}/api/builds/${buildId}/artifact`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       window.location.href = res.data.url;
@@ -55,7 +56,7 @@ export const BuildDetails: React.FC = () => {
   const handleCancelBuild = async () => {
     try {
       const token = localStorage.getItem('token');
-      await axios.post(`http://localhost:3000/api/builds/${buildId}/cancel`, {}, {
+      await axios.post(`${API_URL}/api/builds/${buildId}/cancel`, {}, {
         headers: { Authorization: `Bearer ${token}` }
       });
       // We don't need to manually update state here because the WebSocket will 
@@ -71,7 +72,7 @@ export const BuildDetails: React.FC = () => {
       if (!buildId) return;
       try {
         const token = localStorage.getItem('token');
-        const res = await axios.get(`http://localhost:3000/api/builds/${buildId}`, {
+        const res = await axios.get(`${API_URL}/api/builds/${buildId}`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         setBuild(res.data);

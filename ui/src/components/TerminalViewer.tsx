@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { io, Socket } from 'socket.io-client';
 import axios from 'axios';
 import '@xterm/xterm/css/xterm.css';
+import { API_URL } from '../config';
 
 interface TerminalViewerProps {
   buildId: string;
@@ -48,7 +49,7 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
       term.writeln('\x1b[33m[SYSTEM] Fetching historical logs...\x1b[0m\r');
       if (onStatusChange) onStatusChange('COMPLETED');
       
-      axios.get(`http://localhost:3000/api/builds/${buildId}/logs`, {
+      axios.get(`${API_URL}/api/builds/${buildId}/logs`, {
         headers: { Authorization: `Bearer ${token}` }
       })
       .then(res => {
@@ -75,7 +76,7 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
     // Otherwise, establish WebSocket Connection for live streaming
     term.writeln('\x1b[33m[SYSTEM] Initializing stream pipeline...\x1b[0m\r');
     
-    const socket: Socket = io('http://localhost:3000', {
+    const socket: Socket = io(API_URL, {
       auth: { token: `Bearer ${token}` }
     });
 

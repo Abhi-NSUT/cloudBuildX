@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
+import { API_URL } from '../config';
 
 interface Build {
   id: string;
@@ -37,7 +38,7 @@ export const Dashboard: React.FC = () => {
       const params = new URLSearchParams({ page: page.toString(), limit: '10' });
       if (statusFilter) params.append('status', statusFilter);
 
-      const res = await axios.get(`http://localhost:3000/api/builds?${params.toString()}`, {
+      const res = await axios.get(`${API_URL}/api/builds?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       setBuilds(res.data.data);
@@ -56,7 +57,7 @@ export const Dashboard: React.FC = () => {
   const fetchAnalytics = async () => {
     try {
       const token = localStorage.getItem('token');
-      const res = await axios.get('http://localhost:3000/api/analytics', {
+      const res = await axios.get(`${API_URL}/api/analytics`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       setAnalytics(res.data);
@@ -89,7 +90,7 @@ export const Dashboard: React.FC = () => {
       const repoName = githubUrl.split('/').pop()?.replace('.git', '') || 'Unnamed Repo';
       
       const repoRes = await axios.post(
-        'http://localhost:3000/api/repositories',
+        `${API_URL}/api/repositories`,
         { name: repoName, githubUrl },
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -98,7 +99,7 @@ export const Dashboard: React.FC = () => {
 
       // 2. Trigger the build using the newly created ID
       const buildRes = await axios.post(
-        'http://localhost:3000/api/builds',
+        `${API_URL}/api/builds`,
         { repositoryId },
         { headers: { Authorization: `Bearer ${token}` } }
       );

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
-
+import { API_URL } from '../config';
 export const Auth: React.FC = () => {
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState('');
@@ -18,15 +18,15 @@ export const Auth: React.FC = () => {
     try {
       if (isLogin) {
         // Handle Login
-        const res = await axios.post('http://localhost:3000/auth/login', { email, password });
+        const res = await axios.post(`${API_URL}/auth/login`, { email, password });
         localStorage.setItem('token', res.data.token);
         navigate('/');
       } else {
         // Handle Register
-        await axios.post('http://localhost:3000/auth/register', { email, password });
+        await axios.post(`${API_URL}/auth/register`, { email, password });
         
         // Immediately login after successful registration to get the token
-        const loginRes = await axios.post('http://localhost:3000/auth/login', { email, password });
+        const loginRes = await axios.post(`${API_URL}/auth/login`, { email, password });
         localStorage.setItem('token', loginRes.data.token);
         navigate('/');
       }
