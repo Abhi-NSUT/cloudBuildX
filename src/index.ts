@@ -3,6 +3,7 @@ import cors from 'cors';
 import { requireAuth } from './middleware/auth';
 import { createBuild, getBuilds, getBuildById, getBuildArtifact, getBuildLogs, cancelBuild } from './routes/builds';
 import { createRepository, getRepositories } from './routes/repositories';
+import { getDashboardAnalytics } from './routes/analytics';
 import { register, login } from './routes/auth';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -32,6 +33,9 @@ app.get('/api/builds/:id', requireAuth, getBuildById);
 app.get('/api/builds/:id/artifact', requireAuth, getBuildArtifact);
 app.get('/api/builds/:id/logs', requireAuth, getBuildLogs);
 app.post('/api/builds/:id/cancel', requireAuth, cancelBuild);
+
+// Dashboard Analytics route
+app.get('/api/analytics', requireAuth, getDashboardAnalytics);
 
 // 1. Wrap Express in a native HTTP server
 const server = http.createServer(app);
