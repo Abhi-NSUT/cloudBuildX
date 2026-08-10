@@ -85,7 +85,7 @@ export const getBuilds = async (req: AuthRequest, res: Response) => {
     };
 
     if (status) {
-      whereClause.status = status.toUpperCase();
+      whereClause.status = status.toUpperCase() as any;
     }
 
     // 3. Execute data fetch and count simultaneously
