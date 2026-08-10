@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { requireAuth } from './middleware/auth';
 import { createBuild, getBuilds, getBuildById, getBuildArtifact, getBuildLogs, cancelBuild } from './routes/builds';
-import { createRepository } from './routes/repositories';
+import { createRepository, getRepositories } from './routes/repositories';
 import { register, login } from './routes/auth';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -25,6 +25,7 @@ app.post('/auth/login', login);
 
 // Protect the route with requireAuth middleware
 app.post('/api/repositories', requireAuth, createRepository);
+app.get('/api/repositories', requireAuth, getRepositories);
 app.post('/api/builds', requireAuth, createBuild);
 app.get('/api/builds', requireAuth, getBuilds);
 app.get('/api/builds/:id', requireAuth, getBuildById);
