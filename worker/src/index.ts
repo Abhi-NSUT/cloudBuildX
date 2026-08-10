@@ -34,18 +34,18 @@ const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 const docker = new Docker(); // Connects to local Docker daemon
-const connection = new IORedis(process.env.REDIS_URL || {
+const connection = new IORedis((process.env.REDIS_URL as any) || {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: 6379,
   maxRetriesPerRequest: null,
 });
 
-const publisher = new IORedis(process.env.REDIS_URL || {
+const publisher = new IORedis((process.env.REDIS_URL as any) || {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: Number(process.env.REDIS_PORT) || 6379,
 });
 
-const subscriber = new IORedis(process.env.REDIS_URL || {
+const subscriber = new IORedis((process.env.REDIS_URL as any) || {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: Number(process.env.REDIS_PORT) || 6379,
 });

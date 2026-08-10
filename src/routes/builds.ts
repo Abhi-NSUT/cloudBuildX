@@ -267,7 +267,7 @@ export const cancelBuild = async (req: AuthRequest, res: Response) => {
     });
 
     // 2. Broadcast the kill signal to the workers
-    const redisPublisher = new IORedis(process.env.REDIS_URL || { 
+    const redisPublisher = new IORedis((process.env.REDIS_URL as any) || { 
       host: process.env.REDIS_HOST || '127.0.0.1', 
       port: Number(process.env.REDIS_PORT) || 6379 
     });

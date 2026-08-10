@@ -3,7 +3,7 @@ import { prisma } from '../db';
 import { AuthRequest } from '../middleware/auth';
 import IORedis from 'ioredis';
 
-const redis = new IORedis(process.env.REDIS_URL || {
+const redis = new IORedis((process.env.REDIS_URL as any) || {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: Number(process.env.REDIS_PORT) || 6379,
 });

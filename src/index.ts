@@ -49,7 +49,7 @@ const io = new SocketIOServer(server, {
 });
 
 // 3. Create a dedicated Redis Subscriber connection
-const subscriber = new IORedis(process.env.REDIS_URL || {
+const subscriber = new IORedis((process.env.REDIS_URL as any) || {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: Number(process.env.REDIS_PORT) || 6379,
 });
