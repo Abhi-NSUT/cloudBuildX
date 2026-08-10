@@ -78,7 +78,7 @@ npm run dev
 ```
 
 ## 📸 Dashboard & Architecture
-*(Add screenshots of your Dashboard, the live Terminal streaming logs, and the Create Build page here!)*
+*(Will be added soon!)*
 
 ## 🐛 Known Issues & Future Improvements
 - **GitHub Webhooks:** Implement GitHub App webhooks to automatically trigger builds when code is pushed to the `main` branch.
