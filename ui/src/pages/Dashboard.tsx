@@ -17,15 +17,24 @@ export const Dashboard: React.FC = () => {
   const [repositoryId, setRepositoryId] = useState('');
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
+  const [page, setPage] = useState(1);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [meta, setMeta] = useState<any>(null);
   const navigate = useNavigate();
 
   const fetchBuilds = async () => {
+    setLoading(true);
     try {
       const token = localStorage.getItem('token');
-      const res = await axios.get('http://localhost:3000/api/builds', {
+      
+      const params = new URLSearchParams({ page: page.toString(), limit: '10' });
+      if (statusFilter) params.append('status', statusFilter);
+
+      const res = await axios.get(`http://localhost:3000/api/builds?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      setBuilds(res.data);
+      setBuilds(res.data.data);
+      setMeta(res.data.meta);
     } catch (err) {
       console.error('Error fetching build history:', err);
     } finally {
@@ -35,7 +44,7 @@ export const Dashboard: React.FC = () => {
 
   useEffect(() => {
     fetchBuilds();
-  }, []);
+  }, [page, statusFilter]);
 
   const handleTriggerBuild = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -87,9 +96,22 @@ export const Dashboard: React.FC = () => {
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
         <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50">
           <h2 className="text-lg font-bold text-gray-800">Recent Build Executions</h2>
-          <button onClick={fetchBuilds} className="text-sm text-blue-600 hover:text-blue-800">
-            Refresh Table
-          </button>
+          <div className="flex items-center gap-4">
+            <select 
+              value={statusFilter} 
+              onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}
+              className="text-sm border border-gray-300 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              <option value="">All Statuses</option>
+              <option value="SUCCESS">Success</option>
+              <option value="FAILED">Failed</option>
+              <option value="PENDING">Pending</option>
+              <option value="RUNNING">Running</option>
+            </select>
+            <button onClick={fetchBuilds} className="text-sm text-blue-600 hover:text-blue-800 transition-colors">
+              Refresh Table
+            </button>
+          </div>
         </div>
 
         {loading ? (
@@ -135,6 +157,31 @@ export const Dashboard: React.FC = () => {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {/* Pagination Controls */}
+        {meta && meta.totalPages > 1 && (
+          <div className="px-6 py-4 border-t border-gray-100 bg-gray-50 flex justify-between items-center">
+            <span className="text-sm text-gray-600">
+              Showing page {meta.page} of {meta.totalPages} ({meta.total} total builds)
+            </span>
+            <div className="flex gap-2">
+              <button 
+                disabled={!meta.hasPreviousPage}
+                onClick={() => setPage(p => Math.max(1, p - 1))}
+                className="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-100 transition-colors font-medium text-gray-700"
+              >
+                Previous
+              </button>
+              <button 
+                disabled={!meta.hasNextPage}
+                onClick={() => setPage(p => p + 1)}
+                className="px-3 py-1 border border-gray-300 rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-100 transition-colors font-medium text-gray-700"
+              >
+                Next
+              </button>
+            </div>
           </div>
         )}
       </div>
