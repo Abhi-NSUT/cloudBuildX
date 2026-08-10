@@ -77,6 +77,7 @@ io.on('connection', (socket) => {
 // 5. Global Redis Message Listener
 // When Redis receives a message from the Worker, it triggers this.
 subscriber.on('message', (channel, message) => {
+  console.log(`[REDIS MSG] ${channel}: ${message.substring(0, 50)}...`);
   if (channel.startsWith('build-logs:')) {
     const buildId = channel.split(':')[1];
     
