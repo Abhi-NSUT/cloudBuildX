@@ -1,8 +1,20 @@
 {
   "rewrites": [
     {
+      "source": "/api/(.*)",
+      "destination": "http://3.91.32.101/api/$1"
+    },
+    {
+      "source": "/auth/(.*)",
+      "destination": "http://3.91.32.101/auth/$1"
+    },
+    {
+      "source": "/socket.io/(.*)",
+      "destination": "http://3.91.32.101/socket.io/$1"
+    },
+    {
       "source": "/(.*)",
-      "destination": "/"
+      "destination": "/index.html"
     }
   ]
 }
