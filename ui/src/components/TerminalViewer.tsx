@@ -77,7 +77,10 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
     term.writeln('\x1b[33m[SYSTEM] Initializing stream pipeline...\x1b[0m\r');
     
     const socket: Socket = io(API_URL, {
-      auth: { token: `Bearer ${token}` }
+      auth: { token: `Bearer ${token}` },
+      path: '/socket.io',
+      transports: ['polling'],
+      reconnectionAttempts: 5,
     });
 
     socket.on('connect', () => {
