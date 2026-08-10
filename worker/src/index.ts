@@ -18,15 +18,22 @@ import crypto from 'crypto';
 
 dotenv.config();
 
-const s3Client = new S3Client({
+const s3Config: any = process.env.AWS_ACCESS_KEY_ID ? {
+  region: process.env.AWS_REGION || 'us-east-1',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
+  }
+} : {
   region: 'us-east-1',
   endpoint: `http://${process.env.MINIO_ENDPOINT || 'localhost'}:${process.env.MINIO_PORT || 9000}`,
   credentials: {
     accessKeyId: process.env.MINIO_ROOT_USER || '',
     secretAccessKey: process.env.MINIO_ROOT_PASSWORD || ''
   },
-  forcePathStyle: true // Required for MinIO
-});
+  forcePathStyle: true
+};
+const s3Client = new S3Client(s3Config);
 
 // Initialize Prisma v7 with pg adapter
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
