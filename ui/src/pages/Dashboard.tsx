@@ -20,7 +20,7 @@ interface Analytics {
 
 export const Dashboard: React.FC = () => {
   const [builds, setBuilds] = useState<Build[]>([]);
-  const [repositoryId, setRepositoryId] = useState('');
+  const [githubUrl, setGithubUrl] = useState('');
   const [loading, setLoading] = useState(true);
   const [triggering, setTriggering] = useState(false);
   const [page, setPage] = useState(1);
@@ -42,8 +42,12 @@ export const Dashboard: React.FC = () => {
       });
       setBuilds(res.data.data);
       setMeta(res.data.meta);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error fetching build history:', err);
+      if (err.response?.status === 401) {
+        localStorage.removeItem('token');
+        navigate('/login');
+      }
     } finally {
       setLoading(false);
     }
@@ -56,8 +60,12 @@ export const Dashboard: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` }
       });
       setAnalytics(res.data);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error fetching analytics:', err);
+      if (err.response?.status === 401) {
+        localStorage.removeItem('token');
+        navigate('/login');
+      }
     }
   };
 
@@ -71,21 +79,34 @@ export const Dashboard: React.FC = () => {
 
   const handleTriggerBuild = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!repositoryId) return;
+    if (!githubUrl) return;
 
     setTriggering(true);
     try {
       const token = localStorage.getItem('token');
-      const res = await axios.post(
+      
+      // 1. Create the repository automatically from the URL
+      const repoName = githubUrl.split('/').pop()?.replace('.git', '') || 'Unnamed Repo';
+      
+      const repoRes = await axios.post(
+        'http://localhost:3000/api/repositories',
+        { name: repoName, githubUrl },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      const repositoryId = repoRes.data.repositoryId;
+
+      // 2. Trigger the build using the newly created ID
+      const buildRes = await axios.post(
         'http://localhost:3000/api/builds',
         { repositoryId },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
-      navigate(`/builds/${res.data.buildId}`);
+      navigate(`/builds/${buildRes.data.buildId}`);
     } catch (err) {
       console.error('Failed to trigger build:', err);
-      alert('Failed to trigger build. Verify repository ID.');
+      alert('Failed to trigger build. Check console for details.');
     } finally {
       setTriggering(false);
     }
@@ -116,10 +137,10 @@ export const Dashboard: React.FC = () => {
         <h2 className="text-xl font-bold text-gray-800 mb-4">Trigger New Build</h2>
         <form onSubmit={handleTriggerBuild} className="flex gap-4">
           <input
-            type="text"
-            placeholder="Repository ID (e.g., repo_123456)"
-            value={repositoryId}
-            onChange={(e) => setRepositoryId(e.target.value)}
+            type="url"
+            placeholder="GitHub Repository URL (e.g., https://github.com/vercel/nextjs-portfolio-starter)"
+            value={githubUrl}
+            onChange={(e) => setGithubUrl(e.target.value)}
             className="flex-grow px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
             required
           />

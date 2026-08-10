@@ -75,8 +75,12 @@ export const BuildDetails: React.FC = () => {
           headers: { Authorization: `Bearer ${token}` }
         });
         setBuild(res.data);
-      } catch (err) {
+      } catch (err: any) {
         console.error('Failed to fetch build details:', err);
+        if (err.response?.status === 401) {
+          localStorage.removeItem('token');
+          window.location.href = '/login';
+        }
       }
     };
 

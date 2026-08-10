@@ -18,6 +18,7 @@ enum BuildStatus {
   RUNNING
   SUCCESS
   FAILED
+  CANCELLED
 }
 
 // -----------------------------------------------------------------
@@ -59,6 +60,7 @@ model Build {
   id          String      @id @default(uuid())
   status      BuildStatus @default(PENDING)
   commitHash  String?     @map("commit_hash") // Optional: specific commit to build
+  workerNode  String?     @map("worker_node") // Optional: worker that picked up this build
   
   // Timestamps to track queue wait times and execution duration
   createdAt   DateTime    @default(now()) @map("created_at")

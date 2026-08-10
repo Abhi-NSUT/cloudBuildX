@@ -83,8 +83,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
   const { buildId, repositoryUrl, commitHash } = job.data;
   
   // Define a unique, absolute path for this specific build
-  const workspaceDir = path.resolve(__dirname, '../../tmp-workspaces', buildId);
-  const logFilePath = path.resolve(__dirname, '../../tmp-workspaces', `${buildId}.log`);
+  const workspaceDir = `/tmp/cloudbuildx-workspaces/${buildId}`;
+  const logFilePath = `/tmp/cloudbuildx-workspaces/${buildId}.log`;
   let logFileStream: fsSync.WriteStream | null = null;
 
   console.log(`\n[${WORKER_ID}] Picked up build: ${buildId} (Job ${job.id})`);

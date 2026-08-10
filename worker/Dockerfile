@@ -17,8 +17,8 @@ RUN npm run build
 FROM node:20-alpine AS runner
 WORKDIR /app
 
-# Install the Docker CLI to allow Docker-in-Docker commands via Dockerode
-RUN apk add --no-cache docker-cli
+# Install the Docker CLI to allow Docker-in-Docker commands via Dockerode, and git to clone repos
+RUN apk add --no-cache docker-cli git
 
 COPY package*.json ./
 RUN npm ci --omit=dev
