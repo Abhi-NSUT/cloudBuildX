@@ -1,5 +1,6 @@
 import { Response } from 'express';
 import { prisma } from '../db';
+import { Prisma } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
 import { buildQueue } from '../queue';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
@@ -68,26 +69,58 @@ export const getBuilds = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.id;
 
-    const builds = await prisma.build.findMany({
-      where: {
-        repository: {
-          userId: userId
-        }
-      },
-      include: {
-        repository: {
-          select: {
-            name: true,
-            githubUrl: true
+    // 1. Parse and sanitize inputs
+    const page = parseInt(req.query.page as string) || 1;
+    let limit = parseInt(req.query.limit as string) || 10;
+    
+    // SECURITY: Enforce a hard cap on the limit
+    if (limit > 100) limit = 100; 
+    
+    const skip = (page - 1) * limit;
+    const status = req.query.status as string;
+
+    // 2. Construct the dynamic Prisma WHERE clause
+    const whereClause: Prisma.BuildWhereInput = {
+      repository: { userId: userId }
+    };
+
+    if (status) {
+      whereClause.status = status.toUpperCase();
+    }
+
+    // 3. Execute data fetch and count simultaneously
+    const [builds, totalCount] = await Promise.all([
+      prisma.build.findMany({
+        where: whereClause,
+        skip: skip,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          repository: {
+            select: {
+              name: true,
+              githubUrl: true
+            }
           }
         }
-      },
-      orderBy: {
-        createdAt: 'desc'
+      }),
+      prisma.build.count({
+        where: whereClause
+      })
+    ]);
+
+    // 4. Return a structured REST response with metadata
+    return res.status(200).json({
+      data: builds,
+      meta: {
+        total: totalCount,
+        page: page,
+        limit: limit,
+        totalPages: Math.ceil(totalCount / limit),
+        hasNextPage: page * limit < totalCount,
+        hasPreviousPage: page > 1
       }
     });
-
-    return res.status(200).json(builds);
   } catch (error) {
     console.error('Error fetching builds:', error);
     return res.status(500).json({ error: 'Failed to fetch build history' });
