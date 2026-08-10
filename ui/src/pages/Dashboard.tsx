@@ -12,6 +12,12 @@ interface Build {
   };
 }
 
+interface Analytics {
+  totalBuilds: number;
+  successRate: number;
+  avgDurationSec: number;
+}
+
 export const Dashboard: React.FC = () => {
   const [builds, setBuilds] = useState<Build[]>([]);
   const [repositoryId, setRepositoryId] = useState('');
@@ -20,6 +26,7 @@ export const Dashboard: React.FC = () => {
   const [page, setPage] = useState(1);
   const [statusFilter, setStatusFilter] = useState('');
   const [meta, setMeta] = useState<any>(null);
+  const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const navigate = useNavigate();
 
   const fetchBuilds = async () => {
@@ -42,9 +49,25 @@ export const Dashboard: React.FC = () => {
     }
   };
 
+  const fetchAnalytics = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get('http://localhost:3000/api/analytics', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setAnalytics(res.data);
+    } catch (err) {
+      console.error('Error fetching analytics:', err);
+    }
+  };
+
   useEffect(() => {
     fetchBuilds();
   }, [page, statusFilter]);
+
+  useEffect(() => {
+    fetchAnalytics();
+  }, []);
 
   const handleTriggerBuild = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -70,6 +93,24 @@ export const Dashboard: React.FC = () => {
 
   return (
     <div className="max-w-6xl mx-auto p-6 space-y-8">
+      {/* Analytics Dashboard */}
+      {analytics && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center hover:shadow-md transition-shadow">
+            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Total Executions</h3>
+            <span className="text-3xl font-bold text-gray-900 mt-2">{analytics.totalBuilds}</span>
+          </div>
+          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center hover:shadow-md transition-shadow">
+            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Success Rate</h3>
+            <span className="text-3xl font-bold text-green-600 mt-2">{analytics.successRate}%</span>
+          </div>
+          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center hover:shadow-md transition-shadow">
+            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Avg Build Time</h3>
+            <span className="text-3xl font-bold text-blue-600 mt-2">{analytics.avgDurationSec}s</span>
+          </div>
+        </div>
+      )}
+
       {/* Action Header */}
       <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
         <h2 className="text-xl font-bold text-gray-800 mb-4">Trigger New Build</h2>
