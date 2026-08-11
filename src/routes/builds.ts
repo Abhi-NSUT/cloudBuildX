@@ -2,7 +2,7 @@ import { Response } from 'express';
 import { prisma } from '../db';
 import { Prisma } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
-import { buildQueue } from '../queue';
+import { buildQueue, redisConnection } from '../queue';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import IORedis from 'ioredis';
@@ -58,6 +58,9 @@ export const createBuild = async (req: AuthRequest, res: Response) => {
       },
       removeOnComplete: true,
     });
+
+    // Send a high-priority Wake Up signal to any sleeping workers
+    await redisConnection.publish('wakeup-worker', 'wake_up');
 
     return res.status(201).json({
       message: 'Build triggered and queued successfully',

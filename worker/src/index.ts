@@ -63,25 +63,6 @@ const activeContainers = new Map<string, Docker.Container>();
 const activeJobs = new Set<string>();
 const cancelledBuilds = new Set<string>();
 
-subscriber.subscribe('cancel-build');
-subscriber.on('message', async (channel, buildId) => {
-  if (channel === 'cancel-build') {
-    if (activeJobs.has(buildId)) {
-      console.log(`[Worker ${WORKER_ID}] Cancel signal received for build ${buildId}!`);
-      cancelledBuilds.add(buildId);
-      
-      if (activeContainers.has(buildId)) {
-        const container = activeContainers.get(buildId);
-        try {
-          await container?.kill();
-        } catch (e) {
-          console.error(`[Worker ${WORKER_ID}] Error killing container for build ${buildId}:`, e);
-        }
-      }
-    }
-  }
-});
-
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
 const WORKER_ID = `worker-${crypto.randomBytes(4).toString('hex')}`;
@@ -352,15 +333,60 @@ const worker = new Worker('build-queue', async (job: Job) => {
 
 worker.on('failed', (job, err) => {
   console.error(`[${WORKER_ID}] Job ${job?.id} failed:`, err.message);
+  wakeUp();
 });
 
 worker.on('completed', (job) => {
   console.log(`[${WORKER_ID}] Job ${job.id} completed successfully.`);
+  wakeUp();
 });
 
 worker.on('stalled', (jobId) => {
   console.warn(`[${WORKER_ID}] ⚠️ Warning: Job ${jobId} stalled. A worker likely crashed. BullMQ is re-queueing it for another node.`);
 });
+
+// ==========================================
+// AUTO-SLEEP ARCHITECTURE
+// ==========================================
+let sleepTimer: NodeJS.Timeout | null = null;
+
+const goSleep = async () => {
+  console.log(`\n[${WORKER_ID}] 💤 Worker has been idle for 5 minutes. Pausing to save Redis free-tier commands...`);
+  await worker.pause();
+};
+
+const wakeUp = async () => {
+  if (worker.isPaused()) {
+    console.log(`\n[${WORKER_ID}] ⚡ Received Wake-Up Signal! Resuming job processing...`);
+    await worker.resume();
+  }
+  
+  if (sleepTimer) clearTimeout(sleepTimer);
+  sleepTimer = setTimeout(goSleep, 5 * 60 * 1000); // 5 minutes
+};
+
+subscriber.subscribe('cancel-build', 'wakeup-worker');
+subscriber.on('message', async (channel, message) => {
+  if (channel === 'wakeup-worker') {
+    wakeUp();
+  } else if (channel === 'cancel-build') {
+    const buildId = message;
+    if (activeJobs.has(buildId)) {
+      console.log(`[Worker ${WORKER_ID}] Cancel signal received for build ${buildId}!`);
+      cancelledBuilds.add(buildId);
+      if (activeContainers.has(buildId)) {
+        try {
+          await activeContainers.get(buildId)?.kill();
+        } catch (e) {
+          console.error(`[Worker ${WORKER_ID}] Error killing container for build ${buildId}:`, e);
+        }
+      }
+    }
+  }
+});
+
+// Start the initial sleep timer
+wakeUp();
 
 // Graceful Shutdown Implementation
 const shutdown = async (signal: string) => {

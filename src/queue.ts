@@ -2,7 +2,7 @@ import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 
 // Connect to the Redis container you started in docker-compose
-const connection = process.env.REDIS_URL 
+export const redisConnection = process.env.REDIS_URL 
   ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null }) 
   : new IORedis({
       host: process.env.REDIS_HOST || '127.0.0.1',
@@ -11,4 +11,4 @@ const connection = process.env.REDIS_URL
     });
 
 // Instantiate the queue. "build-queue" is the channel name.
-export const buildQueue = new Queue('build-queue', { connection });
+export const buildQueue = new Queue('build-queue', { connection: redisConnection });
