@@ -346,7 +346,8 @@ const worker = new Worker('build-queue', async (job: Job) => {
   connection, 
   concurrency: 1, 
   lockDuration: 30000, 
-  stalledInterval: 30000 
+  stalledInterval: 30000,
+  drainDelay: 30
 });
 
 worker.on('failed', (job, err) => {
