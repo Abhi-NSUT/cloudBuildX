@@ -2,15 +2,15 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "http://184.73.208.59/api/$1"
+      "destination": "http://18.234.217.92/api/$1"
     },
     {
       "source": "/auth/(.*)",
-      "destination": "http://184.73.208.59/auth/$1"
+      "destination": "http://18.234.217.92/auth/$1"
     },
     {
       "source": "/socket.io/(.*)",
-      "destination": "http://184.73.208.59/socket.io/$1"
+      "destination": "http://18.234.217.92/socket.io/$1"
     },
     {
       "source": "/(.*)",
