@@ -9,7 +9,9 @@ CloudBuildX is a custom-built infrastructure platform similar to GitHub Actions.
 ## ✨ Core Engineering Features
 
 *   **Distributed Architecture:** API and Worker servers are decoupled using a BullMQ Redis message broker, enabling atomic job locking and infinite horizontal scaling of worker nodes.
-*   **Database & Cache Optimization:** Engineered a Redis Cache-Aside pattern with active TTL invalidation to reduce database reads by 99%, and utilized Prisma ORM for parallelized SQL aggregations on the analytics dashboard.
+*   **Efficient Data Access:** Uses Prisma ORM with parallelized queries (`Promise.all`) for the analytics dashboard (SQL `groupBy` status aggregation + recent build durations) and paginated build history.
+*   **Wake-on-Demand Workers:** Idle workers automatically sleep after 5 minutes and are woken instantly via a Redis Pub/Sub signal when a build is queued, conserving serverless Redis command quotas.
+*   **Build Cancellation:** Builds can be cancelled from the UI within the first 15 seconds; the signal is broadcast over Redis Pub/Sub and the worker kills the container mid-execution.
 *   **Isolated Execution:** Safely executes untrusted user code inside ephemeral Docker containers, dynamically provisioned via the Docker Engine API with strict host memory and CPU quotas.
 *   **Real-Time Telemetry:** Streams raw Docker execution logs (stdout/stderr) directly from the isolated backend containers to the browser in real-time utilizing WebSockets and Redis Pub/Sub.
 *   **Infrastructure as Code (IaC):** Utilizes `js-yaml` to parse repository-level `build.yml` configuration files, dynamically injecting custom environments and commands into the execution engine.
@@ -45,16 +47,20 @@ cd cloudBuildX
 ```
 
 ### 2. Environment Variables
-Copy the `.env.example` file to `.env` and fill in your database credentials:
+Copy the example file for both the API and the Worker. The defaults already match the local Docker Compose services:
 ```bash
 cp .env.example .env
+cp .env.example worker/.env
 ```
 
 ### 3. Start the Infrastructure (Database, Redis, MinIO)
-We use Docker Compose to spin up local instances of PostgreSQL, Redis, and AWS S3 (MinIO).
+We use Docker Compose to spin up local instances of PostgreSQL, Redis, and S3-compatible storage (MinIO):
 ```bash
-docker-compose up -d
+docker-compose up -d postgres redis minio
 ```
+Then open the MinIO console at http://localhost:9001 (login `admin` / `strongpassword123`) and create a bucket named `cloudbuildx-artifacts`.
+
+> Prefer running everything in containers? `docker-compose up -d --build` starts the API, Worker and UI as well (UI on http://localhost).
 
 ### 4. Start the API
 ```bash
@@ -77,8 +83,17 @@ npm install
 npm run dev
 ```
 
-## 📸 Dashboard & Architecture
-*(Will be added soon!)*
+## 🏗️ Architecture
+
+### Real-Time Build Log Streaming
+Container stdout/stderr is captured by the Worker, published to Redis Pub/Sub, and relayed by the API to the browser over WebSockets.
+
+![Build Log Streaming Pipeline](docs/log-streaming-pipeline.png)
+
+### Isolated Execution & Artifact Storage
+The Worker clones the repository, runs it inside a resource-limited Docker container (512 MB RAM, 50% CPU) via Dockerode, then zips the output and streams it to S3. Artifacts are downloaded through short-lived pre-signed URLs.
+
+![Dockerode Artifact Storage](docs/artifact-storage.png)
 
 ## 🐛 Known Issues & Future Improvements
 - **GitHub Webhooks:** Implement GitHub App webhooks to automatically trigger builds when code is pushed to the `main` branch.
