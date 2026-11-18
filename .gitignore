@@ -5,3 +5,15 @@ node_modules
 /src/generated/prisma
 
 *.md
+
+# Editor / AI tooling
+.agents/
+.windsurf/
+skills-lock.json
+
+# Build leftovers
+*.d.ts.map
+tmp-workspaces/
+
+# Local notes
+transcript.md
