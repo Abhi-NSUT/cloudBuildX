@@ -2,52 +2,40 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../db';
+import { JWT_SECRET } from '../middleware/auth';
+import { AppError } from '../middleware/errorHandler';
+import { logger } from '../logger';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'YOUR_SUPER_SECRET_KEY';
+const BCRYPT_ROUNDS = 10;
 
+// Body is already validated by registerSchema.
 export const register = async (req: Request, res: Response) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
-    
-    const existingUser = await prisma.user.findUnique({ where: { email } });
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already exists' });
-    }
+  const { email, password } = req.body as { email: string; password: string };
 
-    const passwordHash = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({
-      data: { email, passwordHash }
-    });
+  const existingUser = await prisma.user.findUnique({ where: { email } });
+  if (existingUser) throw new AppError(409, 'Email already exists');
 
-    res.status(201).json({ message: 'User registered successfully', userId: user.id });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  // Only the bcrypt hash is stored, never the plain-text password.
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const user = await prisma.user.create({ data: { email, passwordHash } });
+
+  logger.info('User registered', { userId: user.id });
+  res.status(201).json({ message: 'User registered successfully', userId: user.id });
 };
 
+// Body is already validated by loginSchema.
 export const login = async (req: Request, res: Response) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
-    
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+  const { email, password } = req.body as { email: string; password: string };
 
-    const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+  const user = await prisma.user.findUnique({ where: { email } });
 
-    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '24h' });
-    res.status(200).json({ token });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+  // Same message for unknown email and wrong password so attackers can't enumerate accounts.
+  const isValid = user ? await bcrypt.compare(password, user.passwordHash) : false;
+  if (!user || !isValid) {
+    logger.warn('Failed login attempt');
+    throw new AppError(401, 'Invalid credentials');
   }
+
+  const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+  res.status(200).json({ token, role: user.role });
 };

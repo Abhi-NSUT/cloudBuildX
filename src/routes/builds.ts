@@ -1,11 +1,12 @@
 import { Response } from 'express';
 import { prisma } from '../db';
-import { Prisma } from '@prisma/client';
-import { AuthRequest } from '../middleware/auth';
+import { Prisma, BuildStatus } from '@prisma/client';
+import { AuthRequest, assertOwnerOrAdmin } from '../middleware/auth';
+import { AppError } from '../middleware/errorHandler';
 import { buildQueue, redisConnection } from '../queue';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import IORedis from 'ioredis';
+import { logger } from '../logger';
 
 const s3Config: any = process.env.AWS_ACCESS_KEY_ID ? {
   region: process.env.AWS_REGION || 'us-east-1',
@@ -23,269 +24,159 @@ const s3Config: any = process.env.AWS_ACCESS_KEY_ID ? {
   forcePathStyle: true
 };
 const s3Client = new S3Client(s3Config);
+const BUCKET = process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts';
+const CANCEL_WINDOW_MS = 15_000;
 
+// Loads a build and enforces ownership (owner or admin). 404 if missing, 403 if not allowed.
+const findAccessibleBuild = async (req: AuthRequest) => {
+  const build = await prisma.build.findUnique({
+    where: { id: req.params.id as string },
+    include: { repository: true },
+  });
+  if (!build) throw new AppError(404, 'Build not found');
+  assertOwnerOrAdmin(req.user, build.repository.userId);
+  return build;
+};
+
+// POST /api/builds - body validated by createBuildSchema
 export const createBuild = async (req: AuthRequest, res: Response) => {
-  try {
-    const { repositoryId, commitHash } = req.body;
-    const userId = req.user?.id;
+  const { repositoryId, commitHash } = req.body as { repositoryId: string; commitHash?: string };
 
-    if (!repositoryId) return res.status(400).json({ error: 'repositoryId required' });
+  const repo = await prisma.repository.findUnique({ where: { id: repositoryId } });
+  if (!repo) throw new AppError(404, 'Repository not found');
+  assertOwnerOrAdmin(req.user, repo.userId);
 
-    const repo = await prisma.repository.findUnique({ where: { id: repositoryId } });
-    
-    if (!repo) return res.status(404).json({ error: 'Repository not found' });
-    if (repo.userId !== userId) return res.status(403).json({ error: 'Unauthorized' });
+  const build = await prisma.build.create({
+    data: { repositoryId: repo.id, commitHash: commitHash || null, status: 'PENDING' },
+  });
 
-    // Database Action: Create the build
-    const build = await prisma.build.create({
-      data: {
-        repositoryId: repo.id,
-        commitHash: commitHash || null,
-        status: 'PENDING',
-      }
-    });
+  await buildQueue.add('execute-build', {
+    buildId: build.id,
+    repositoryUrl: repo.githubUrl,
+    commitHash: build.commitHash,
+  }, {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: true,
+  });
 
-    // Push the job to BullMQ
-    await buildQueue.add('execute-build', {
-      buildId: build.id,
-      repositoryUrl: repo.githubUrl,
-      commitHash: build.commitHash
-    }, {
-      attempts: 3, // Try up to 3 times
-      backoff: {
-        type: 'exponential',
-        delay: 5000, // Wait 5s, then 25s, etc.
-      },
-      removeOnComplete: true,
-    });
+  // Wake any sleeping workers
+  await redisConnection.publish('wakeup-worker', 'wake_up');
 
-    // Send a high-priority Wake Up signal to any sleeping workers
-    await redisConnection.publish('wakeup-worker', 'wake_up');
+  logger.info('Build queued', { buildId: build.id, repositoryId: repo.id, userId: req.user!.id });
 
-    return res.status(201).json({
-      message: 'Build triggered and queued successfully',
-      buildId: build.id,
-      status: build.status
-    });
-
-  } catch (error) {
-    console.error('Error triggering build:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
+  return res.status(201).json({
+    message: 'Build triggered and queued successfully',
+    buildId: build.id,
+    status: build.status,
+  });
 };
 
-// GET /api/builds - Fetch all builds for the authenticated user
+// GET /api/builds - users see their own builds, admins see every build
 export const getBuilds = async (req: AuthRequest, res: Response) => {
-  try {
-    const userId = req.user?.id;
+  const user = req.user!;
 
-    // 1. Parse and sanitize inputs
-    const page = parseInt(req.query.page as string) || 1;
-    let limit = parseInt(req.query.limit as string) || 10;
-    
-    // SECURITY: Enforce a hard cap on the limit
-    if (limit > 100) limit = 100; 
-    
-    const skip = (page - 1) * limit;
-    const status = req.query.status as string;
+  const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 10, 1), 100);
+  const skip = (page - 1) * limit;
+  const status = (req.query.status as string | undefined)?.toUpperCase();
 
-    // 2. Construct the dynamic Prisma WHERE clause
-    const whereClause: Prisma.BuildWhereInput = {
-      repository: { userId: userId }
-    };
+  const whereClause: Prisma.BuildWhereInput =
+    user.role === 'ADMIN' ? {} : { repository: { userId: user.id } };
 
-    if (status) {
-      whereClause.status = status.toUpperCase() as any;
+  if (status) {
+    if (!Object.values(BuildStatus).includes(status as BuildStatus)) {
+      throw new AppError(400, `status must be one of ${Object.values(BuildStatus).join(', ')}`);
     }
-
-    // 3. Execute data fetch and count simultaneously
-    const [builds, totalCount] = await Promise.all([
-      prisma.build.findMany({
-        where: whereClause,
-        skip: skip,
-        take: limit,
-        orderBy: { createdAt: 'desc' },
-        include: {
-          repository: {
-            select: {
-              name: true,
-              githubUrl: true
-            }
-          }
-        }
-      }),
-      prisma.build.count({
-        where: whereClause
-      })
-    ]);
-
-    // 4. Return a structured REST response with metadata
-    return res.status(200).json({
-      data: builds,
-      meta: {
-        total: totalCount,
-        page: page,
-        limit: limit,
-        totalPages: Math.ceil(totalCount / limit),
-        hasNextPage: page * limit < totalCount,
-        hasPreviousPage: page > 1
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching builds:', error);
-    return res.status(500).json({ error: 'Failed to fetch build history' });
+    whereClause.status = status as BuildStatus;
   }
+
+  const [builds, totalCount] = await Promise.all([
+    prisma.build.findMany({
+      where: whereClause,
+      skip,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: { repository: { select: { name: true, githubUrl: true } } },
+    }),
+    prisma.build.count({ where: whereClause }),
+  ]);
+
+  return res.status(200).json({
+    data: builds,
+    meta: {
+      total: totalCount,
+      page,
+      limit,
+      totalPages: Math.ceil(totalCount / limit),
+      hasNextPage: page * limit < totalCount,
+      hasPreviousPage: page > 1,
+    },
+  });
 };
 
-// GET /api/builds/:id - Fetch a specific build by ID
+// GET /api/builds/:id
 export const getBuildById = async (req: AuthRequest, res: Response) => {
-  try {
-    const id = req.params.id as string;
-    const userId = req.user?.id;
-
-    const build = await prisma.build.findUnique({
-      where: { id },
-      include: {
-        repository: true
-      }
-    });
-
-    if (!build) {
-      return res.status(404).json({ error: 'Build not found' });
-    }
-
-    if (build.repository.userId !== userId) {
-      return res.status(403).json({ error: 'Unauthorized access to this build' });
-    }
-
-    return res.status(200).json(build);
-  } catch (error) {
-    console.error('Error fetching build details:', error);
-    return res.status(500).json({ error: 'Failed to fetch build details' });
-  }
+  const build = await findAccessibleBuild(req);
+  return res.status(200).json(build);
 };
 
-// GET /api/builds/:id/artifact - Get a presigned download URL for the artifact
+// GET /api/builds/:id/artifact - presigned download URL (15 min)
 export const getBuildArtifact = async (req: AuthRequest, res: Response) => {
-  try {
-    const id = req.params.id as string;
-    const userId = req.user?.id;
+  const build = await findAccessibleBuild(req);
 
-    const build = await prisma.build.findUnique({
-      where: { id },
-      include: { repository: true }
-    });
-
-    if (!build) {
-      return res.status(404).json({ error: 'Build not found' });
-    }
-
-    if (build.repository.userId !== userId) {
-      return res.status(403).json({ error: 'Unauthorized access' });
-    }
-
-    if (build.status !== 'SUCCESS') {
-      return res.status(400).json({ error: 'Artifacts are only available for successful builds' });
-    }
-
-    const command = new GetObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
-      Key: `builds/${id}.zip`
-    });
-
-    // URL expires in 15 minutes (900 seconds)
-    const url = await getSignedUrl(s3Client, command, { expiresIn: 900 });
-
-    return res.status(200).json({ url });
-  } catch (error) {
-    console.error('Error generating artifact URL:', error);
-    return res.status(500).json({ error: 'Failed to generate download link' });
+  if (build.status !== 'SUCCESS') {
+    throw new AppError(400, 'Artifacts are only available for successful builds');
   }
+
+  const command = new GetObjectCommand({ Bucket: BUCKET, Key: `builds/${build.id}.zip` });
+  const url = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+
+  return res.status(200).json({ url });
 };
 
-// GET /api/builds/:id/logs - Fetch the historical log file for a completed build
+// GET /api/builds/:id/logs - historical log file for a finished build
 export const getBuildLogs = async (req: AuthRequest, res: Response) => {
+  const build = await findAccessibleBuild(req);
+
+  if (build.status === 'PENDING' || build.status === 'RUNNING') {
+    throw new AppError(400, 'Logs are still streaming. Please connect via WebSockets.');
+  }
+
   try {
-    const id = req.params.id as string;
-    const userId = req.user?.id;
-
-    const build = await prisma.build.findUnique({
-      where: { id },
-      include: { repository: true }
-    });
-
-    if (!build) return res.status(404).json({ error: 'Build not found' });
-    if (build.repository.userId !== userId) return res.status(403).json({ error: 'Unauthorized access' });
-
-    if (build.status === 'PENDING' || build.status === 'RUNNING') {
-      return res.status(400).json({ error: 'Logs are still streaming. Please connect via WebSockets.' });
+    const s3Response = await s3Client.send(
+      new GetObjectCommand({ Bucket: BUCKET, Key: `builds/${build.id}.log` })
+    );
+    res.setHeader('Content-Type', 'text/plain');
+    (s3Response.Body as any).pipe(res);
+  } catch (s3Error: any) {
+    if (s3Error.name === 'NoSuchKey') {
+      throw new AppError(404, 'Log file not found in storage. It may have been deleted.');
     }
-
-    const command = new GetObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
-      Key: `builds/${id}.log`
-    });
-
-    try {
-      const s3Response = await s3Client.send(command);
-      
-      // The body is a Readable stream in Node.js
-      const stream = s3Response.Body as any;
-      
-      res.setHeader('Content-Type', 'text/plain');
-      stream.pipe(res);
-      
-    } catch (s3Error: any) {
-      if (s3Error.name === 'NoSuchKey') {
-        return res.status(404).json({ error: 'Log file not found in storage. It may have been deleted.' });
-      }
-      throw s3Error;
-    }
-  } catch (error) {
-    console.error('Error fetching build logs:', error);
-    return res.status(500).json({ error: 'Failed to fetch build logs' });
+    throw s3Error;
   }
 };
 
 // POST /api/builds/:id/cancel
 export const cancelBuild = async (req: AuthRequest, res: Response) => {
-  try {
-    const id = req.params.id as string;
-    const userId = req.user?.id;
+  const build = await findAccessibleBuild(req);
 
-    const build = await prisma.build.findUnique({
-      where: { id },
-      include: { repository: true }
-    });
-
-    if (!build) return res.status(404).json({ error: 'Build not found' });
-    if (build.repository.userId !== userId) return res.status(403).json({ error: 'Unauthorized' });
-    
-    if (build.status === 'SUCCESS' || build.status === 'FAILED' || build.status === 'CANCELLED') {
-      return res.status(400).json({ error: 'Build is already finished' });
-    }
-
-    const timeSinceCreation = Date.now() - new Date(build.createdAt).getTime();
-    if (timeSinceCreation > 15000) {
-      return res.status(400).json({ error: 'Cancellation is only allowed within the first 15 seconds' });
-    }
-
-    // 1. Update the database immediately
-    await prisma.build.update({
-      where: { id },
-      data: { status: 'CANCELLED', completedAt: new Date() }
-    });
-
-    // 2. Broadcast the kill signal to the workers
-    const redisPublisher = new IORedis((process.env.REDIS_URL as any) || { 
-      host: process.env.REDIS_HOST || '127.0.0.1', 
-      port: Number(process.env.REDIS_PORT) || 6379 
-    });
-    await redisPublisher.publish(`cancel-build`, id);
-
-    return res.status(200).json({ message: 'Cancellation requested' });
-  } catch (error) {
-    console.error('Error canceling build:', error);
-    return res.status(500).json({ error: 'Failed to cancel build' });
+  if (build.status === 'SUCCESS' || build.status === 'FAILED' || build.status === 'CANCELLED') {
+    throw new AppError(400, 'Build is already finished');
   }
+
+  if (Date.now() - new Date(build.createdAt).getTime() > CANCEL_WINDOW_MS) {
+    throw new AppError(400, 'Cancellation is only allowed within the first 15 seconds');
+  }
+
+  await prisma.build.update({
+    where: { id: build.id },
+    data: { status: 'CANCELLED', completedAt: new Date() },
+  });
+
+  // Broadcast the kill signal to the workers (reuses the shared connection)
+  await redisConnection.publish('cancel-build', build.id);
+
+  logger.info('Build cancelled', { buildId: build.id, userId: req.user!.id });
+  return res.status(200).json({ message: 'Cancellation requested' });
 };

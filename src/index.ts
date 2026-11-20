@@ -1,91 +1,90 @@
-import express from 'express';
-import cors from 'cors';
-import { requireAuth } from './middleware/auth';
-import { createBuild, getBuilds, getBuildById, getBuildArtifact, getBuildLogs, cancelBuild } from './routes/builds';
-import { createRepository, getRepositories } from './routes/repositories';
-import { getDashboardAnalytics } from './routes/analytics';
-import { register, login } from './routes/auth';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import IORedis from 'ioredis';
+import { app } from './app';
+import { prisma } from './db';
+import { verifyToken, AuthUser } from './middleware/auth';
+import { logger } from './logger';
 
-const app = express();
 const port = process.env.PORT || 3000;
-
-app.use(cors());
-app.use(express.json());
-
-// Healthcheck route
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Auth routes
-app.post('/auth/register', register);
-app.post('/auth/login', login);
-
-// Protect the route with requireAuth middleware
-app.post('/api/repositories', requireAuth, createRepository);
-app.get('/api/repositories', requireAuth, getRepositories);
-app.post('/api/builds', requireAuth, createBuild);
-app.get('/api/builds', requireAuth, getBuilds);
-app.get('/api/builds/:id', requireAuth, getBuildById);
-app.get('/api/builds/:id/artifact', requireAuth, getBuildArtifact);
-app.get('/api/builds/:id/logs', requireAuth, getBuildLogs);
-app.post('/api/builds/:id/cancel', requireAuth, cancelBuild);
-
-// Dashboard Analytics route
-app.get('/api/analytics', requireAuth, getDashboardAnalytics);
 
 // 1. Wrap Express in a native HTTP server
 const server = http.createServer(app);
 
 // 2. Initialize Socket.io
 const io = new SocketIOServer(server, {
-  cors: {
-    origin: '*', // For Day 5, restrict this to your React app's URL
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-// 3. Create a dedicated Redis Subscriber connection
+// 3. Dedicated Redis subscriber connection (a subscribed connection can't run other commands)
 const subscriber = new IORedis((process.env.REDIS_URL as any) || {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: Number(process.env.REDIS_PORT) || 6379,
 });
 
-// 4. Handle WebSocket Connections
-io.on('connection', (socket) => {
-  console.log(`🟢 Client connected: ${socket.id}`);
-
-  // When the React app mounts the build details page, it emits this event
-  socket.on('subscribeToBuild', async (buildId: string) => {
-    console.log(`Client ${socket.id} subscribed to logs for build: ${buildId}`);
-    
-    // Put the socket in a specific "room" for this build
-    socket.join(buildId);
-    
-    // Tell Redis we want to listen to this channel
-    await subscriber.subscribe(`build-logs:${buildId}`);
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`🔴 Client disconnected: ${socket.id}`);
-  });
-});
-
-// 5. Global Redis Message Listener
-// When Redis receives a message from the Worker, it triggers this.
-subscriber.on('message', (channel, message) => {
-  console.log(`[REDIS MSG] ${channel}: ${message.substring(0, 50)}...`);
-  if (channel.startsWith('build-logs:')) {
-    const buildId = channel.split(':')[1];
-    
-    // Broadcast the message ONLY to sockets currently in this build's room
-    io.to(buildId).emit('build-log', JSON.parse(message));
+// 4. Authenticate every socket with the same JWT as the REST API
+io.use((socket, next) => {
+  const raw = String(socket.handshake.auth?.token ?? '');
+  const token = raw.startsWith('Bearer ') ? raw.slice('Bearer '.length) : raw;
+  try {
+    socket.data.user = verifyToken(token);
+    next();
+  } catch {
+    logger.warn('Rejected unauthenticated socket connection', { socketId: socket.id });
+    next(new Error('Unauthorized'));
   }
 });
 
+io.on('connection', (socket) => {
+  const user = socket.data.user as AuthUser;
+  logger.debug('Socket connected', { socketId: socket.id, userId: user.id });
+
+  // Only the build's owner (or an admin) may stream its logs
+  socket.on('subscribeToBuild', async (buildId: string) => {
+    try {
+      const build = await prisma.build.findUnique({
+        where: { id: String(buildId) },
+        select: { repository: { select: { userId: true } } },
+      });
+
+      if (!build || (user.role !== 'ADMIN' && build.repository.userId !== user.id)) {
+        logger.warn('Socket subscription denied', { buildId, userId: user.id });
+        socket.emit('build-log', { type: 'error', text: 'You do not have access to this build.' });
+        return;
+      }
+
+      socket.join(buildId);
+      await subscriber.subscribe(`build-logs:${buildId}`);
+    } catch (error: any) {
+      logger.error('Socket subscription failed', { buildId, error: error.message, stack: error.stack });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    logger.debug('Socket disconnected', { socketId: socket.id });
+  });
+});
+
+// 5. Relay worker log lines from Redis to the right socket room
+subscriber.on('message', (channel, message) => {
+  if (!channel.startsWith('build-logs:')) return;
+  const buildId = channel.split(':')[1]!;
+  try {
+    io.to(buildId).emit('build-log', JSON.parse(message));
+  } catch (error: any) {
+    logger.error('Invalid log message from Redis', { channel, error: error.message });
+  }
+});
+
+// Last-resort safety nets: log, don't die silently
+process.on('unhandledRejection', (reason: any) => {
+  logger.error('Unhandled promise rejection', { error: reason?.message ?? String(reason), stack: reason?.stack });
+});
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught exception, shutting down', { error: error.message, stack: error.stack });
+  process.exit(1);
+});
+
 server.listen(port, () => {
-  console.log(`CloudBuildX API & WebSocket Server running on port ${port}`);
+  logger.info(`CloudBuildX API & WebSocket server running on port ${port}`);
 });

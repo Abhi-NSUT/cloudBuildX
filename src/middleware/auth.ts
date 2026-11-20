@@ -1,10 +1,27 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { AppError } from './errorHandler';
+
+export type Role = 'USER' | 'ADMIN';
+
+export interface AuthUser {
+  id: string;
+  role: Role;
+}
 
 // Extend the Express Request type to include our user object
 export interface AuthRequest extends Request {
-  user?: { id: string };
+  user?: AuthUser;
 }
+
+export const JWT_SECRET = process.env.JWT_SECRET || 'YOUR_SUPER_SECRET_KEY';
+
+// Verifies a raw JWT (without the "Bearer " prefix). Throws on invalid/expired tokens.
+// Tokens issued before roles existed have no role claim, so they default to USER.
+export const verifyToken = (token: string): AuthUser => {
+  const decoded = jwt.verify(token, JWT_SECRET) as { id: string; role?: Role };
+  return { id: decoded.id, role: decoded.role === 'ADMIN' ? 'ADMIN' : 'USER' };
+};
 
 export const requireAuth = (req: AuthRequest, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
@@ -13,16 +30,32 @@ export const requireAuth = (req: AuthRequest, res: Response, next: NextFunction)
     return res.status(401).json({ error: 'Missing or invalid token' });
   }
 
-  const token = authHeader.split(' ')[1];
-
   try {
-    // Note: In production, load this secret from process.env.JWT_SECRET
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'YOUR_SUPER_SECRET_KEY') as { id: string };
-    
-    // Attach the decoded user payload to the request object
-    req.user = decoded; 
+    req.user = verifyToken(authHeader.slice('Bearer '.length));
     next();
-  } catch (error) {
+  } catch {
     return res.status(401).json({ error: 'Token expired or invalid' });
+  }
+};
+
+// Must run after requireAuth. Allows the request only if the user has one of the given roles.
+export const requireRole =
+  (...roles: Role[]) =>
+  (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
+
+// Ownership rule used by every build/repository lookup: owners see their own
+// resources, admins see everything. Throws so routes stay linear.
+export const assertOwnerOrAdmin = (user: AuthUser | undefined, ownerId: string) => {
+  if (!user) throw new AppError(401, 'Authentication required');
+  if (user.role !== 'ADMIN' && user.id !== ownerId) {
+    throw new AppError(403, 'You do not have access to this resource');
   }
 };
