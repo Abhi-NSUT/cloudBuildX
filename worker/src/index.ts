@@ -15,6 +15,8 @@ import { Upload } from '@aws-sdk/lib-storage';
 import archiver = require('archiver');
 import * as fsSync from 'fs';
 import crypto from 'crypto';
+import { logger } from './logger';
+import { recordBuildStarted, recordBuildFinished } from './metrics';
 
 dotenv.config();
 
@@ -63,11 +65,9 @@ const activeContainers = new Map<string, Docker.Container>();
 const activeJobs = new Set<string>();
 const cancelledBuilds = new Set<string>();
 
-const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
 const WORKER_ID = `worker-${crypto.randomBytes(4).toString('hex')}`;
-console.log(`🚀 Starting Node: ${WORKER_ID}`);
-log(`Worker is listening for jobs on "build-queue"...`);
+logger.info('Worker started, listening for jobs on "build-queue"', { workerId: WORKER_ID });
 
 const worker = new Worker('build-queue', async (job: Job) => {
   const { buildId, repositoryUrl, commitHash } = job.data;
@@ -77,7 +77,9 @@ const worker = new Worker('build-queue', async (job: Job) => {
   const logFilePath = `/tmp/cloudbuildx-workspaces/${buildId}.log`;
   let logFileStream: fsSync.WriteStream | null = null;
 
-  console.log(`\n[${WORKER_ID}] Picked up build: ${buildId} (Job ${job.id})`);
+  const buildStartedAt = Date.now();
+  logger.info('Build started', { buildId, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID, repositoryUrl });
+  recordBuildStarted();
   activeJobs.add(buildId);
 
   try {
@@ -94,7 +96,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     logFileStream.write(`${initMsg}\r\n`);
 
     // 1. Ensure a clean slate (Forcefully remove ghost directories)
-    console.log(`[${WORKER_ID}] Initializing workspace...`);
+    logger.info(`[${WORKER_ID}] Initializing workspace...`);
     try {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     } catch (e) { /* Ignore if it doesn't exist */ }
@@ -103,19 +105,19 @@ const worker = new Worker('build-queue', async (job: Job) => {
     await fs.mkdir(workspaceDir, { recursive: true });
 
     // 2. Clone the Repository
-    console.log(`[Job ${job.id}] Cloning repository...`);
+    logger.info(`[Job ${job.id}] Cloning repository...`);
     const git = simpleGit();
     
     await git.clone(repositoryUrl, workspaceDir);
     
     if (commitHash) {
-      console.log(`[Job ${job.id}] Checking out commit ${commitHash}...`);
+      logger.info(`[Job ${job.id}] Checking out commit ${commitHash}...`);
       await simpleGit(workspaceDir).checkout(commitHash);
     }
-    console.log(`[Job ${job.id}] Repository cloned successfully.`);
+    logger.info(`[Job ${job.id}] Repository cloned successfully.`);
     
     // 3. Parse build.yml Configuration
-    console.log(`[Job ${job.id}] Looking for build.yml...`);
+    logger.info(`[Job ${job.id}] Looking for build.yml...`);
     let config = { 
       image: 'node:18-alpine', 
       commands: ['npm install', 'npm run build'] 
@@ -130,13 +132,13 @@ const worker = new Worker('build-queue', async (job: Job) => {
       if (parsedConfig.commands && Array.isArray(parsedConfig.commands)) {
         config.commands = parsedConfig.commands;
       }
-      console.log(`[Job ${job.id}] Loaded custom build config:`, config);
+      logger.info('Loaded custom build config', { buildId, config });
     } catch (e) {
-      console.log(`[Job ${job.id}] No valid build.yml found, using Node.js defaults.`);
+      logger.info(`[Job ${job.id}] No valid build.yml found, using Node.js defaults.`);
     }
 
     // 4. Safely Pull the Docker Image
-    console.log(`[Job ${job.id}] Pulling Docker image: ${config.image}...`);
+    logger.info(`[Job ${job.id}] Pulling Docker image: ${config.image}...`);
     await new Promise<void>((resolve, reject) => {
       docker.pull(config.image, (err: any, stream: any) => {
         if (err) return reject(new Error(`Failed to pull image ${config.image}: ${err.message}`));
@@ -146,10 +148,10 @@ const worker = new Worker('build-queue', async (job: Job) => {
         });
       });
     });
-    console.log(`[Job ${job.id}] Image pulled successfully.`);
+    logger.info(`[Job ${job.id}] Image pulled successfully.`);
 
     // 5. Create & Start the Container
-    console.log(`[Job ${job.id}] Creating isolated container...`);
+    logger.info(`[Job ${job.id}] Creating isolated container...`);
     const shellCmd = config.commands.join(' && ');
 
     const container = await docker.createContainer({
@@ -175,7 +177,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     }
 
     // 6. Start the Container
-    console.log(`[Job ${job.id}] Starting container execution...`);
+    logger.info(`[Job ${job.id}] Starting container execution...`);
     await container.start();
 
     // 7. Demultiplex Logs (Properly separating stdout and stderr)
@@ -189,7 +191,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     stdoutStream.on('data', async (chunk) => {
       const text = chunk.toString('utf8').trim();
       if (text) {
-        console.log(`[Job ${job.id} INFO] ${text}`);
+        logger.debug(text, { buildId, stream: 'stdout' });
         publisher.publish(channel, JSON.stringify({ type: 'info', text }));
         if (logFileStream) logFileStream.write(`${text}\r\n`);
         await job.updateProgress(50); // Explicit heartbeat
@@ -199,7 +201,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     stderrStream.on('data', async (chunk) => {
       const text = chunk.toString('utf8').trim();
       if (text) {
-        console.log(`[Job ${job.id} ERR]  ${text}`);
+        logger.debug(text, { buildId, stream: 'stderr' });
         publisher.publish(channel, JSON.stringify({ type: 'error', text }));
         // Add ANSI red formatting for errors in the log file
         if (logFileStream) logFileStream.write(`\x1b[31m${text}\x1b[0m\r\n`);
@@ -218,7 +220,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
         container.wait().then(data => data.StatusCode),
         new Promise<number>((_, reject) => 
           setTimeout(async () => {
-            console.log(`[Job ${job.id}] Timeout reached! Killing container...`);
+            logger.info(`[Job ${job.id}] Timeout reached! Killing container...`);
             await container.kill(); 
             reject(new Error('Build timed out after 10 minutes'));
           }, TIMEOUT_MS)
@@ -226,7 +228,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
       ]);
     } finally {
       // 9. Clean up the container from Docker Engine
-      console.log(`[Job ${job.id}] Removing container from host...`);
+      logger.info(`[Job ${job.id}] Removing container from host...`);
       // We remove it from activeContainers here so that we don't try to kill it 
       // if a cancel signal arrives during the artifact zipping phase!
       activeContainers.delete(buildId);
@@ -238,7 +240,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     }
 
     // 9.5 Zip and Upload Artifacts to MinIO
-    console.log(`[Job ${job.id}] Zipping artifacts and uploading to MinIO...`);
+    logger.info(`[Job ${job.id}] Zipping artifacts and uploading to MinIO...`);
     publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Compressing and uploading artifacts...' }));
     logFileStream.write(`\r\n\x1b[35m[SYSTEM EVENT] Compressing and uploading artifacts...\x1b[0m\r\n`);
     
@@ -262,7 +264,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
 
     await upload.done();
     
-    console.log(`[Job ${job.id}] Artifacts uploaded successfully.`);
+    logger.info(`[Job ${job.id}] Artifacts uploaded successfully.`);
     publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts uploaded successfully.' }));
 
     // 10. Mark Success in PostgreSQL
@@ -270,12 +272,16 @@ const worker = new Worker('build-queue', async (job: Job) => {
       where: { id: buildId },
       data: { status: 'SUCCESS', completedAt: new Date() }
     });
-    console.log(`[Job ${job.id}] Build completed successfully!`);
+    const durationMs = Date.now() - buildStartedAt;
+    logger.info('Build finished', { buildId, status: 'SUCCESS', durationMs });
+    recordBuildFinished(buildId, 'success', durationMs);
     publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Build completed successfully.' }));
 
   } catch (error: any) {
     if (cancelledBuilds.has(buildId) || error.message === 'BUILD_CANCELLED') {
-      console.error(`[Job ${job.id}] Build was cancelled by user.`);
+      const durationMs = Date.now() - buildStartedAt;
+      logger.warn('Build finished', { buildId, status: 'CANCELLED', durationMs });
+      recordBuildFinished(buildId, 'cancelled', durationMs);
       const channel = `build-logs:${buildId}`;
       publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build cancelled by user.` }));
       if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build cancelled by user.\x1b[0m\r\n`);
@@ -284,7 +290,9 @@ const worker = new Worker('build-queue', async (job: Job) => {
         where: { id: buildId },
         data: { status: 'FAILED', completedAt: new Date() }
       });
-      console.error(`[Job ${job.id}] Failed:`, error);
+      const durationMs = Date.now() - buildStartedAt;
+      logger.error('Build finished', { buildId, status: 'FAILED', durationMs, attempt: job.attemptsMade + 1, error: error.message, stack: error.stack });
+      recordBuildFinished(buildId, 'failed', durationMs);
       const channel = `build-logs:${buildId}`;
       publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build failed: ${error.message}` }));
       if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build failed: ${error.message}\x1b[0m\r\n`);
@@ -296,7 +304,7 @@ const worker = new Worker('build-queue', async (job: Job) => {
     // Cleanup workspaces
     try {
       if (logFileStream) {
-        console.log(`[Job ${job.id}] Uploading historical logs to MinIO...`);
+        logger.info(`[Job ${job.id}] Uploading historical logs to MinIO...`);
         logFileStream.end();
         
         const logUpload = new Upload({
@@ -309,18 +317,18 @@ const worker = new Worker('build-queue', async (job: Job) => {
           },
         });
         await logUpload.done();
-        console.log(`[Job ${job.id}] Historical logs uploaded successfully.`);
+        logger.info(`[Job ${job.id}] Historical logs uploaded successfully.`);
       }
     } catch (uploadErr) {
-      console.error(`[Job ${job.id}] Failed to upload historical logs:`, uploadErr);
+      logger.error('Failed to upload historical logs', { buildId, error: (uploadErr as Error).message });
     }
 
     try {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       await fs.rm(logFilePath, { force: true });
-      console.log(`[Job ${job.id}] Cleaned up workspace and local logs.`);
+      logger.info(`[Job ${job.id}] Cleaned up workspace and local logs.`);
     } catch (cleanupErr) {
-      console.error(`[Job ${job.id}] FATAL: Failed to clean up workspace:`, cleanupErr);
+      logger.error('Failed to clean up workspace', { buildId, error: (cleanupErr as Error).message });
     }
   }
 }, { 
@@ -332,17 +340,17 @@ const worker = new Worker('build-queue', async (job: Job) => {
 });
 
 worker.on('failed', (job, err) => {
-  console.error(`[${WORKER_ID}] Job ${job?.id} failed:`, err.message);
+  logger.error('Job failed', { jobId: job?.id, attemptsMade: job?.attemptsMade, error: err.message });
   wakeUp();
 });
 
 worker.on('completed', (job) => {
-  console.log(`[${WORKER_ID}] Job ${job.id} completed successfully.`);
+  logger.info(`[${WORKER_ID}] Job ${job.id} completed successfully.`);
   wakeUp();
 });
 
 worker.on('stalled', (jobId) => {
-  console.warn(`[${WORKER_ID}] ⚠️ Warning: Job ${jobId} stalled. A worker likely crashed. BullMQ is re-queueing it for another node.`);
+  logger.warn(`[${WORKER_ID}] ⚠️ Warning: Job ${jobId} stalled. A worker likely crashed. BullMQ is re-queueing it for another node.`);
 });
 
 // ==========================================
@@ -351,13 +359,13 @@ worker.on('stalled', (jobId) => {
 let sleepTimer: NodeJS.Timeout | null = null;
 
 const goSleep = async () => {
-  console.log(`\n[${WORKER_ID}] 💤 Worker has been idle for 5 minutes. Pausing to save Redis free-tier commands...`);
+  logger.info(`[${WORKER_ID}] 💤 Worker has been idle for 5 minutes. Pausing to save Redis free-tier commands...`);
   await worker.pause();
 };
 
 const wakeUp = async () => {
   if (worker.isPaused()) {
-    console.log(`\n[${WORKER_ID}] ⚡ Received Wake-Up Signal! Resuming job processing...`);
+    logger.info(`[${WORKER_ID}] ⚡ Received Wake-Up Signal! Resuming job processing...`);
     await worker.resume();
   }
   
@@ -372,13 +380,13 @@ subscriber.on('message', async (channel, message) => {
   } else if (channel === 'cancel-build') {
     const buildId = message;
     if (activeJobs.has(buildId)) {
-      console.log(`[Worker ${WORKER_ID}] Cancel signal received for build ${buildId}!`);
+      logger.info(`[Worker ${WORKER_ID}] Cancel signal received for build ${buildId}!`);
       cancelledBuilds.add(buildId);
       if (activeContainers.has(buildId)) {
         try {
           await activeContainers.get(buildId)?.kill();
         } catch (e) {
-          console.error(`[Worker ${WORKER_ID}] Error killing container for build ${buildId}:`, e);
+          logger.error('Error killing container', { buildId, error: (e as Error).message });
         }
       }
     }
@@ -390,17 +398,17 @@ wakeUp();
 
 // Graceful Shutdown Implementation
 const shutdown = async (signal: string) => {
-  console.log(`\n[${WORKER_ID}] Received ${signal}. Initiating graceful shutdown...`);
+  logger.info(`[${WORKER_ID}] Received ${signal}. Initiating graceful shutdown...`);
   
   await worker.close(); // Stop accepting new jobs
-  console.log(`[${WORKER_ID}] Waiting for active jobs to finish...`);
+  logger.info(`[${WORKER_ID}] Waiting for active jobs to finish...`);
   
   await worker.disconnect(); 
   await prisma.$disconnect();
   publisher.quit();
   connection.quit();
   
-  console.log(`[${WORKER_ID}] Shutdown complete. Goodbye.`);
+  logger.info(`[${WORKER_ID}] Shutdown complete. Goodbye.`);
   process.exit(0);
 };
 
