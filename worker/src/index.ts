@@ -1,455 +1,65 @@
-import { Worker, Job, UnrecoverableError } from 'bullmq';
-import IORedis from 'ioredis';
-import { PrismaClient } from '@prisma/client';
-import { Pool } from 'pg';
-import { PrismaPg } from '@prisma/adapter-pg';
-import dotenv from 'dotenv';
-import Docker from 'dockerode';
-import simpleGit from 'simple-git';
-import fs from 'fs/promises';
-import path from 'path';
-import yaml from 'js-yaml';
-import { PassThrough } from 'stream';
-import { S3Client } from '@aws-sdk/client-s3';
-import { Upload } from '@aws-sdk/lib-storage';
-import archiver = require('archiver');
-import * as fsSync from 'fs';
-import crypto from 'crypto';
+import { Worker } from 'bullmq';
+import { redis, subscriber, prisma, WORKER_ID } from './clients';
+import { processBuild } from './processor';
+import { requestCancel } from './cancellation';
 import { logger } from './logger';
-import { recordBuildStarted, recordBuildFinished } from './metrics';
 
-dotenv.config();
+const IDLE_SLEEP_MS = 5 * 60 * 1000;
 
-const s3Config: any = process.env.AWS_ACCESS_KEY_ID ? {
-  region: process.env.AWS_REGION || 'us-east-1',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
-  }
-} : {
-  region: 'us-east-1',
-  endpoint: `http://${process.env.MINIO_ENDPOINT || 'localhost'}:${process.env.MINIO_PORT || 9000}`,
-  credentials: {
-    accessKeyId: process.env.MINIO_ROOT_USER || '',
-    secretAccessKey: process.env.MINIO_ROOT_PASSWORD || ''
-  },
-  forcePathStyle: true
-};
-const s3Client = new S3Client(s3Config);
-
-// Initialize Prisma v7 with pg adapter
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
-
-const docker = new Docker(); // Connects to local Docker daemon
-const connection = process.env.REDIS_URL
-  ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
-  : new IORedis({
-      host: process.env.REDIS_HOST || '127.0.0.1',
-      port: 6379,
-      maxRetriesPerRequest: null,
-    });
-
-const publisher = new IORedis((process.env.REDIS_URL as any) || {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: Number(process.env.REDIS_PORT) || 6379,
+const worker = new Worker('build-queue', processBuild, {
+  connection: redis,
+  concurrency: 1,
+  lockDuration: 30_000,
+  stalledInterval: 30_000,
+  drainDelay: 30,
 });
 
-const subscriber = new IORedis((process.env.REDIS_URL as any) || {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: Number(process.env.REDIS_PORT) || 6379,
-});
-
-const activeContainers = new Map<string, Docker.Container>();
-const activeJobs = new Set<string>();
-const cancelledBuilds = new Set<string>();
-
-
-const WORKER_ID = `worker-${crypto.randomBytes(4).toString('hex')}`;
 logger.info('Worker started, listening for jobs on "build-queue"', { workerId: WORKER_ID });
-
-// A failure caused by the user's build itself (bad repo, non-zero exit, timeout).
-// Retrying would just fail again, so these are final. Anything else
-// (registry, S3, database hiccups) is treated as infrastructure and retried.
-class BuildError extends Error {}
-
-type FinalStatus = 'SUCCESS' | 'FAILED' | 'CANCELLED';
-
-// Every system event carries an explicit status so the UI never has to parse log text.
-const publishSystem = (buildId: string, text: string, status?: FinalStatus) =>
-  publisher.publish(`build-logs:${buildId}`, JSON.stringify({ type: 'system', text, ...(status && { status }) }));
-
-// Only move RUNNING -> final. If the API already marked the build CANCELLED,
-// this is a no-op and the cancellation wins.
-const finishBuild = (buildId: string, status: 'SUCCESS' | 'FAILED') =>
-  prisma.build.updateMany({
-    where: { id: buildId, status: 'RUNNING' },
-    data: { status, completedAt: new Date() },
-  });
-
-const worker = new Worker('build-queue', async (job: Job) => {
-  const { buildId, repositoryUrl, commitHash } = job.data;
-  
-  // Define a unique, absolute path for this specific build
-  const workspaceDir = `/tmp/cloudbuildx-workspaces/${buildId}`;
-  const logFilePath = `/tmp/cloudbuildx-workspaces/${buildId}.log`;
-  let logFileStream: fsSync.WriteStream | null = null;
-
-  const buildStartedAt = Date.now();
-  activeJobs.add(buildId);
-
-  // Atomically claim the build. A build cancelled while still queued (or already
-  // finished) is skipped. RUNNING is allowed so a stalled job can be recovered.
-  const claim = await prisma.build.updateMany({
-    where: { id: buildId, status: { in: ['PENDING', 'RUNNING'] } },
-    data: { status: 'RUNNING', startedAt: new Date(), workerNode: WORKER_ID },
-  });
-  if (claim.count === 0) {
-    activeJobs.delete(buildId);
-    logger.info('Skipping build that is no longer pending (cancelled or finished)', { buildId });
-    return;
-  }
-
-  logger.info('Build started', { buildId, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID, repositoryUrl });
-  recordBuildStarted();
-
-  try {
-    // Create a write stream for the historical log file right at the start
-    logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
-
-    const initMsg = `Job claimed by ${WORKER_ID}. Starting execution...`;
-    publishSystem(buildId, initMsg);
-    logFileStream.write(`${initMsg}\r\n`);
-
-    // 1. Ensure a clean slate (Forcefully remove ghost directories)
-    logger.info(`[${WORKER_ID}] Initializing workspace...`);
-    try {
-      await fs.rm(workspaceDir, { recursive: true, force: true });
-    } catch (e) { /* Ignore if it doesn't exist */ }
-    
-    // Create the fresh directory
-    await fs.mkdir(workspaceDir, { recursive: true });
-
-    // 2. Clone the Repository
-    logger.info(`[Job ${job.id}] Cloning repository...`);
-    const git = simpleGit();
-    
-    try {
-      await git.clone(repositoryUrl, workspaceDir);
-      if (commitHash) {
-        logger.info(`[Job ${job.id}] Checking out commit ${commitHash}...`);
-        await simpleGit(workspaceDir).checkout(commitHash);
-      }
-    } catch (gitErr: any) {
-      throw new BuildError(`Could not clone repository: ${gitErr.message}`);
-    }
-    logger.info(`[Job ${job.id}] Repository cloned successfully.`);
-    
-    // 3. Parse build.yml Configuration
-    logger.info(`[Job ${job.id}] Looking for build.yml...`);
-    let config = { 
-      image: 'node:18-alpine', 
-      commands: ['npm install', 'npm run build'] 
-    };
-
-    try {
-      const configPath = path.join(workspaceDir, 'build.yml');
-      const fileContents = await fs.readFile(configPath, 'utf8');
-      
-      const parsedConfig = yaml.load(fileContents) as any;
-      if (parsedConfig.image) config.image = parsedConfig.image;
-      if (parsedConfig.commands && Array.isArray(parsedConfig.commands)) {
-        config.commands = parsedConfig.commands;
-      }
-      logger.info('Loaded custom build config', { buildId, config });
-    } catch (e) {
-      logger.info(`[Job ${job.id}] No valid build.yml found, using Node.js defaults.`);
-    }
-
-    // 4. Safely Pull the Docker Image
-    logger.info(`[Job ${job.id}] Pulling Docker image: ${config.image}...`);
-    await new Promise<void>((resolve, reject) => {
-      docker.pull(config.image, (err: any, stream: any) => {
-        if (err) return reject(new Error(`Failed to pull image ${config.image}: ${err.message}`));
-        docker.modem.followProgress(stream, (followErr: any) => {
-          if (followErr) reject(followErr);
-          else resolve();
-        });
-      });
-    });
-    logger.info(`[Job ${job.id}] Image pulled successfully.`);
-
-    // 5. Create & Start the Container
-    logger.info(`[Job ${job.id}] Creating isolated container...`);
-    const shellCmd = config.commands.join(' && ');
-
-    const container = await docker.createContainer({
-      Image: config.image,
-      Cmd: ['/bin/sh', '-c', shellCmd],
-      WorkingDir: '/workspace',
-      HostConfig: {
-        Binds: [`${workspaceDir}:/workspace`],
-        Memory: 512 * 1024 * 1024, // Hard limit of 512MB RAM
-        CpuQuota: 50000,           // Restrict to 50% of a single CPU core
-        SecurityOpt: ['no-new-privileges:true'], // Prevents sudo escalation
-        AutoRemove: false, // We must fetch the exit code first
-      },
-    });
-
-    activeContainers.set(buildId, container);
-
-    // Check if we were cancelled while the container was being created or image pulled
-    if (cancelledBuilds.has(buildId)) {
-      await container.remove({ force: true }).catch(() => {});
-      activeContainers.delete(buildId);
-      throw new Error('BUILD_CANCELLED');
-    }
-
-    // 6. Start the Container
-    logger.info(`[Job ${job.id}] Starting container execution...`);
-    await container.start();
-
-    // 7. Demultiplex Logs (Properly separating stdout and stderr)
-    const logStream = await container.logs({ follow: true, stdout: true, stderr: true });
-    
-    const stdoutStream = new PassThrough();
-    const stderrStream = new PassThrough();
-
-    const channel = `build-logs:${buildId}`;
-
-    stdoutStream.on('data', async (chunk) => {
-      const text = chunk.toString('utf8').trim();
-      if (text) {
-        logger.debug(text, { buildId, stream: 'stdout' });
-        publisher.publish(channel, JSON.stringify({ type: 'info', text }));
-        if (logFileStream) logFileStream.write(`${text}\r\n`);
-        await job.updateProgress(50); // Explicit heartbeat
-      }
-    });
-
-    stderrStream.on('data', async (chunk) => {
-      const text = chunk.toString('utf8').trim();
-      if (text) {
-        logger.debug(text, { buildId, stream: 'stderr' });
-        publisher.publish(channel, JSON.stringify({ type: 'error', text }));
-        // Add ANSI red formatting for errors in the log file
-        if (logFileStream) logFileStream.write(`\x1b[31m${text}\x1b[0m\r\n`);
-        await job.updateProgress(50); // Explicit heartbeat
-      }
-    });
-
-    container.modem.demuxStream(logStream, stdoutStream, stderrStream);
-
-    // 8. Wait for Exit with a Hard Timeout
-    const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes maximum
-    let exitCode: number;
-    let timeoutHandle: NodeJS.Timeout | undefined;
-
-    try {
-      exitCode = await Promise.race([
-        container.wait().then(data => data.StatusCode),
-        new Promise<number>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            logger.warn('Build timed out, killing container', { buildId });
-            container.kill().catch(() => {});
-            reject(new BuildError('Build timed out after 10 minutes'));
-          }, TIMEOUT_MS);
-        })
-      ]);
-    } finally {
-      // Always clear the timer, otherwise it fires 10 minutes later on a removed container
-      clearTimeout(timeoutHandle);
-      // 9. Clean up the container from Docker Engine
-      logger.info(`[Job ${job.id}] Removing container from host...`);
-      // We remove it from activeContainers here so that we don't try to kill it 
-      // if a cancel signal arrives during the artifact zipping phase!
-      activeContainers.delete(buildId);
-      await container.remove({ force: true }).catch(() => {});
-    }
-
-    if (exitCode !== 0) {
-      throw new BuildError(`Build failed with exit code ${exitCode}`);
-    }
-
-    if (cancelledBuilds.has(buildId)) throw new Error('BUILD_CANCELLED');
-
-    // 9.5 Zip and Upload Artifacts to MinIO
-    logger.info(`[Job ${job.id}] Zipping artifacts and uploading to MinIO...`);
-    publishSystem(buildId, 'Compressing and uploading artifacts...');
-    logFileStream.write(`\r\n\x1b[35m[SYSTEM EVENT] Compressing and uploading artifacts...\x1b[0m\r\n`);
-    
-    const archive = new (archiver as any).ZipArchive({ zlib: { level: 9 } });
-    const pass = new PassThrough();
-    
-    archive.pipe(pass);
-
-    const upload = new Upload({
-      client: s3Client,
-      params: {
-        Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
-        Key: `builds/${buildId}.zip`,
-        Body: pass,
-        ContentType: 'application/zip'
-      }
-    });
-
-    archive.directory(workspaceDir, false);
-    archive.finalize();
-
-    await upload.done();
-    
-    logger.info(`[Job ${job.id}] Artifacts uploaded successfully.`);
-    publishSystem(buildId, 'Artifacts uploaded successfully.');
-
-    // 10. Mark Success in PostgreSQL (unless it was cancelled meanwhile)
-    const finished = await finishBuild(buildId, 'SUCCESS');
-    if (finished.count === 0) throw new Error('BUILD_CANCELLED');
-
-    const durationMs = Date.now() - buildStartedAt;
-    logger.info('Build finished', { buildId, status: 'SUCCESS', durationMs });
-    recordBuildFinished(buildId, 'success', durationMs);
-    publishSystem(buildId, 'Build completed successfully.', 'SUCCESS');
-
-  } catch (error: any) {
-    if (cancelledBuilds.has(buildId) || error.message === 'BUILD_CANCELLED') {
-      const durationMs = Date.now() - buildStartedAt;
-      logger.warn('Build finished', { buildId, status: 'CANCELLED', durationMs });
-      recordBuildFinished(buildId, 'cancelled', durationMs);
-      publishSystem(buildId, 'Build cancelled by user.', 'CANCELLED');
-      if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build cancelled by user.\x1b[0m\r\n`);
-    } else {
-      const isBuildError = error instanceof BuildError;
-      const willRetry = !isBuildError && job.attemptsMade + 1 < (job.opts.attempts ?? 1);
-
-      if (willRetry) {
-        // Infrastructure hiccup: put the build back to PENDING and let BullMQ retry with backoff
-        await prisma.build.updateMany({ where: { id: buildId, status: 'RUNNING' }, data: { status: 'PENDING' } });
-        logger.warn('Build hit an infrastructure error, will retry', { buildId, attempt: job.attemptsMade + 1, error: error.message });
-        publishSystem(buildId, `Infrastructure error (${error.message}). Retrying...`);
-        throw error;
-      }
-
-      await finishBuild(buildId, 'FAILED');
-      const durationMs = Date.now() - buildStartedAt;
-      logger.error('Build finished', { buildId, status: 'FAILED', durationMs, attempt: job.attemptsMade + 1, error: error.message, stack: error.stack });
-      recordBuildFinished(buildId, 'failed', durationMs);
-      publishSystem(buildId, `Build failed: ${error.message}`, 'FAILED');
-      if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build failed: ${error.message}\x1b[0m\r\n`);
-      // UnrecoverableError tells BullMQ not to retry a build that failed on its own merits
-      throw new UnrecoverableError(error.message);
-    }
-  } finally {
-    activeJobs.delete(buildId);
-    cancelledBuilds.delete(buildId);
-    // Cleanup workspaces
-    try {
-      if (logFileStream) {
-        logger.info(`[Job ${job.id}] Uploading historical logs to MinIO...`);
-        logFileStream.end();
-        
-        const logUpload = new Upload({
-          client: s3Client,
-          params: {
-            Bucket: process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts',
-            Key: `builds/${buildId}.log`,
-            Body: fsSync.createReadStream(logFilePath),
-            ContentType: 'text/plain',
-          },
-        });
-        await logUpload.done();
-        logger.info(`[Job ${job.id}] Historical logs uploaded successfully.`);
-      }
-    } catch (uploadErr) {
-      logger.error('Failed to upload historical logs', { buildId, error: (uploadErr as Error).message });
-    }
-
-    try {
-      await fs.rm(workspaceDir, { recursive: true, force: true });
-      await fs.rm(logFilePath, { force: true });
-      logger.info(`[Job ${job.id}] Cleaned up workspace and local logs.`);
-    } catch (cleanupErr) {
-      logger.error('Failed to clean up workspace', { buildId, error: (cleanupErr as Error).message });
-    }
-  }
-}, { 
-  connection, 
-  concurrency: 1, 
-  lockDuration: 30000, 
-  stalledInterval: 30000,
-  drainDelay: 30
-});
 
 worker.on('failed', (job, err) => {
   logger.error('Job failed', { jobId: job?.id, attemptsMade: job?.attemptsMade, error: err.message });
   wakeUp();
 });
-
-worker.on('completed', (job) => {
-  logger.info(`[${WORKER_ID}] Job ${job.id} completed successfully.`);
-  wakeUp();
-});
-
+worker.on('completed', () => wakeUp());
 worker.on('stalled', (jobId) => {
-  logger.warn(`[${WORKER_ID}] ⚠️ Warning: Job ${jobId} stalled. A worker likely crashed. BullMQ is re-queueing it for another node.`);
+  logger.warn('Job stalled (a worker likely crashed); BullMQ is re-queueing it', { jobId });
 });
 
 // ==========================================
-// AUTO-SLEEP ARCHITECTURE
+// Wake-on-demand: pause polling after 5 idle minutes to save Redis
+// free-tier commands; the API publishes "wakeup-worker" when a build is queued.
 // ==========================================
-let sleepTimer: NodeJS.Timeout | null = null;
+let sleepTimer: NodeJS.Timeout | undefined;
 
-const goSleep = async () => {
-  logger.info(`[${WORKER_ID}] 💤 Worker has been idle for 5 minutes. Pausing to save Redis free-tier commands...`);
-  await worker.pause();
-};
-
-const wakeUp = async () => {
+const wakeUp = () => {
   if (worker.isPaused()) {
-    logger.info(`[${WORKER_ID}] ⚡ Received Wake-Up Signal! Resuming job processing...`);
-    await worker.resume();
+    logger.info('Wake-up signal received, resuming job processing', { workerId: WORKER_ID });
+    worker.resume();
   }
-  
-  if (sleepTimer) clearTimeout(sleepTimer);
-  sleepTimer = setTimeout(goSleep, 5 * 60 * 1000); // 5 minutes
+  clearTimeout(sleepTimer);
+  sleepTimer = setTimeout(async () => {
+    logger.info('Idle for 5 minutes, pausing to save Redis commands', { workerId: WORKER_ID });
+    await worker.pause();
+  }, IDLE_SLEEP_MS);
 };
 
 subscriber.subscribe('cancel-build', 'wakeup-worker');
-subscriber.on('message', async (channel, message) => {
-  if (channel === 'wakeup-worker') {
-    wakeUp();
-  } else if (channel === 'cancel-build') {
-    const buildId = message;
-    if (activeJobs.has(buildId)) {
-      logger.info(`[Worker ${WORKER_ID}] Cancel signal received for build ${buildId}!`);
-      cancelledBuilds.add(buildId);
-      if (activeContainers.has(buildId)) {
-        try {
-          await activeContainers.get(buildId)?.kill();
-        } catch (e) {
-          logger.error('Error killing container', { buildId, error: (e as Error).message });
-        }
-      }
-    }
-  }
+subscriber.on('message', (channel, message) => {
+  if (channel === 'wakeup-worker') wakeUp();
+  else if (channel === 'cancel-build') void requestCancel(message);
 });
 
-// Start the initial sleep timer
 wakeUp();
 
-// Graceful Shutdown Implementation
+// Graceful shutdown: finish the current job, then close connections
 const shutdown = async (signal: string) => {
-  logger.info(`[${WORKER_ID}] Received ${signal}. Initiating graceful shutdown...`);
-  
-  await worker.close(); // Stop accepting new jobs
-  logger.info(`[${WORKER_ID}] Waiting for active jobs to finish...`);
-  
-  await worker.disconnect(); 
+  logger.info(`Received ${signal}, shutting down gracefully`, { workerId: WORKER_ID });
+  clearTimeout(sleepTimer);
+  await worker.close();
   await prisma.$disconnect();
-  publisher.quit();
-  connection.quit();
-  
-  logger.info(`[${WORKER_ID}] Shutdown complete. Goodbye.`);
+  subscriber.quit();
+  redis.quit();
+  logger.info('Shutdown complete', { workerId: WORKER_ID });
   process.exit(0);
 };
 
