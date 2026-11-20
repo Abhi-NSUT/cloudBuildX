@@ -5,3 +5,5 @@ build
 .env
 tmp-workspaces
 npm-debug.log
+tests
+jest.config.js
