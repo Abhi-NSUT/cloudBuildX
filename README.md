@@ -9,7 +9,10 @@ CloudBuildX is a custom-built infrastructure platform similar to GitHub Actions.
 ## ✨ Core Engineering Features
 
 *   **Distributed Architecture:** API and Worker servers are decoupled using a BullMQ Redis message broker, enabling atomic job locking and infinite horizontal scaling of worker nodes.
-*   **Efficient Data Access:** Uses Prisma ORM with parallelized queries (`Promise.all`) for the analytics dashboard (SQL `groupBy` status aggregation + recent build durations) and paginated build history.
+*   **Efficient Data Access:** Redis Cache-Aside pattern (5-minute TTL with invalidation on write) for repository lookups, plus Prisma ORM with parallelized queries (`Promise.all`) for the analytics dashboard and paginated build history.
+*   **Security:** Passwords hashed with bcrypt; JWT auth with role-based access control (`USER` / `ADMIN`). Users can only see their own builds, repositories and live log streams (WebSocket connections are authenticated too); admins can see everything.
+*   **Input Validation:** Every request body is validated with Zod schemas; invalid requests get a `400` with per-field error details.
+*   **Observability:** Structured Winston logging for every request, build start/finish and error, with build metrics (counts, failure rate, duration) logged per worker and exposed platform-wide via an admin endpoint. A single Express error middleware turns any failure into a clean JSON error.
 *   **Wake-on-Demand Workers:** Idle workers automatically sleep after 5 minutes and are woken instantly via a Redis Pub/Sub signal when a build is queued, conserving serverless Redis command quotas.
 *   **Build Cancellation:** Builds can be cancelled from the UI within the first 15 seconds; the signal is broadcast over Redis Pub/Sub and the worker kills the container mid-execution.
 *   **Isolated Execution:** Safely executes untrusted user code inside ephemeral Docker containers, dynamically provisioned via the Docker Engine API with strict host memory and CPU quotas.
@@ -20,8 +23,9 @@ CloudBuildX is a custom-built infrastructure platform similar to GitHub Actions.
 ## 🛠️ Tech Stack
 
 *   **Frontend:** React, TypeScript, TailwindCSS, Socket.io-client, Vite
-*   **Backend API:** Node.js, Express, TypeScript, Prisma ORM, Socket.io
-*   **Worker Engine:** Node.js, Docker API (Dockerode), BullMQ, `js-yaml`, AWS SDK
+*   **Backend API:** Node.js, Express, TypeScript, Prisma ORM, Socket.io, Zod, bcrypt, Winston
+*   **Worker Engine:** Node.js, Docker API (Dockerode), BullMQ, `js-yaml`, AWS SDK, Winston
+*   **Testing:** Jest, Supertest
 *   **Database:** Neon (Serverless PostgreSQL)
 *   **Message Broker & Cache:** Upstash (Serverless Redis)
 *   **Storage:** Amazon Web Services (AWS S3)
@@ -82,6 +86,45 @@ cd ui
 npm install
 npm run dev
 ```
+
+### 7. (Optional) Promote a user to admin
+New accounts are always `USER`. There is deliberately no API for granting admin, so promote someone directly in the database, then log in again to get a token with the new role:
+```sql
+UPDATE users SET role = 'ADMIN' WHERE email = 'you@example.com';
+```
+
+## ✅ Running Tests
+
+```bash
+npm test
+```
+
+The Jest suite covers the auth middleware (missing/forged tokens, roles), the Zod schemas, and the real Express app via Supertest (validation errors, login, build ownership, and clean 500s), with Prisma and Redis mocked so no infrastructure is needed.
+
+## 📡 API Reference
+
+All endpoints return JSON. Errors always look like `{ "error": "message" }`; validation errors also include `details: [{ "field", "message" }]`.
+🔒 = requires `Authorization: Bearer <token>`. 👑 = requires the `ADMIN` role.
+
+| Method | Endpoint | Auth | Request body | Success response |
+|---|---|---|---|---|
+| `GET` | `/api/health` | — | — | `200 { status: "ok", timestamp }` |
+| `POST` | `/auth/register` | — | `{ email, password }` (password 8–72 chars) | `201 { message, userId }` · `409` if the email exists |
+| `POST` | `/auth/login` | — | `{ email, password }` | `200 { token, role }` (JWT, valid 24h) · `401` invalid credentials |
+| `POST` | `/api/repositories` | 🔒 | `{ name, githubUrl }` | `201 { message, repositoryId }` |
+| `GET` | `/api/repositories` | 🔒 | — | `200 [ { id, name, githubUrl, userId, createdAt, updatedAt } ]` (Redis-cached, 5 min) |
+| `POST` | `/api/builds` | 🔒 | `{ repositoryId: uuid, commitHash?: 7–40 hex chars }` | `201 { message, buildId, status: "PENDING" }` |
+| `GET` | `/api/builds?page=&limit=&status=` | 🔒 | — | `200 { data: [build + repository { name, githubUrl }], meta: { total, page, limit, totalPages, hasNextPage, hasPreviousPage } }`. Users get their own builds, admins get all. `limit` max 100. |
+| `GET` | `/api/builds/:id` | 🔒 | — | `200 { id, status, commitHash, workerNode, createdAt, startedAt, completedAt, repository }` · `403` if not yours |
+| `GET` | `/api/builds/:id/logs` | 🔒 | — | `200` plain-text log of a finished build · `400` while still running |
+| `GET` | `/api/builds/:id/artifact` | 🔒 | — | `200 { url }` pre-signed S3 download link (expires in 15 min) · `400` unless `SUCCESS` |
+| `POST` | `/api/builds/:id/cancel` | 🔒 | — | `200 { message }` · `400` if finished or older than 15 s |
+| `GET` | `/api/analytics` | 🔒 | — | `200 { totalBuilds, successRate, avgDurationSec, metrics: [ { status, _count } ] }` |
+| `GET` | `/api/admin/metrics` | 🔒👑 | — | `200 { totalUsers, builds: { total, byStatus, failureRate }, durationSec: { sampleSize, avg, min, max } }` |
+
+**WebSocket (Socket.io):** connect with `auth: { token: "Bearer <token>" }`, then emit `subscribeToBuild` with a build ID. You will receive `build-log` events `{ type: "info" | "error" | "system", text }`, but only for builds you own (or any build, if you're an admin).
+
+Build `status` is one of `PENDING`, `RUNNING`, `SUCCESS`, `FAILED`, `CANCELLED`.
 
 ## 🏗️ Architecture
 
