@@ -8,7 +8,7 @@ CloudBuildX is a custom-built infrastructure platform similar to GitHub Actions.
 
 ## ✨ Core Engineering Features
 
-*   **Distributed Architecture:** API and Worker servers are decoupled using a BullMQ Redis message broker, enabling atomic job locking and infinite horizontal scaling of worker nodes.
+*   **Distributed Architecture:** API and Worker servers are decoupled using a BullMQ Redis message broker, with atomic job locking. Workers are stateless, so more can be added to drain the queue faster (production runs 3 PM2 processes on one EC2 instance).
 *   **Efficient Data Access:** Redis Cache-Aside pattern (5-minute TTL with invalidation on write) for repository lookups, plus Prisma ORM with parallelized queries (`Promise.all`) for the analytics dashboard and paginated build history.
 *   **Security:** Passwords hashed with bcrypt; JWT auth with role-based access control (`USER` / `ADMIN`). Users can only see their own builds, repositories and live log streams (WebSocket connections are authenticated too); admins can see everything.
 *   **Input Validation:** Every request body is validated with Zod schemas; invalid requests get a `400` with per-field error details.
@@ -17,7 +17,8 @@ CloudBuildX is a custom-built infrastructure platform similar to GitHub Actions.
 *   **Build Cancellation:** Builds can be cancelled from the UI within the first 15 seconds; the signal is broadcast over Redis Pub/Sub and the worker kills the container mid-execution.
 *   **Isolated Execution:** Safely executes untrusted user code inside ephemeral Docker containers, dynamically provisioned via the Docker Engine API with strict host memory and CPU quotas.
 *   **Real-Time Telemetry:** Streams raw Docker execution logs (stdout/stderr) directly from the isolated backend containers to the browser in real-time utilizing WebSockets and Redis Pub/Sub.
-*   **Infrastructure as Code (IaC):** Utilizes `js-yaml` to parse repository-level `build.yml` configuration files, dynamically injecting custom environments and commands into the execution engine.
+*   **Pipeline-as-Code:** Utilizes `js-yaml` to parse a repository-level `build.yml` (Docker image + commands), so each repo defines its own build.
+*   **Reliable Build Lifecycle:** Builds are claimed atomically with conditional status updates, so a cancelled build never runs or gets overwritten. User build failures are final, and only infrastructure errors are retried with exponential backoff.
 *   **Cloud-Native Storage:** Automatically compresses successful build directories into `.zip` artifacts and securely streams them to an Amazon S3 bucket via the AWS SDK.
 
 ## 🛠️ Tech Stack
@@ -69,9 +70,15 @@ Then open the MinIO console at http://localhost:9001 (login `admin` / `strongpas
 ### 4. Start the API
 ```bash
 npm install
-npx prisma db push
+npx prisma migrate deploy
 npm run dev
 ```
+
+> **Upgrading a database created before migrations existed** (with `prisma db push`)? Mark the baseline as applied once, then deploy the remaining migrations:
+> ```bash
+> npx prisma migrate resolve --applied 0_init
+> npx prisma migrate deploy
+> ```
 
 ### 5. Start the Worker (In a new terminal)
 ```bash
@@ -99,7 +106,7 @@ UPDATE users SET role = 'ADMIN' WHERE email = 'you@example.com';
 npm test
 ```
 
-The Jest suite covers the auth middleware (missing/forged tokens, roles), the Zod schemas, and the real Express app via Supertest (validation errors, login, build ownership, and clean 500s), with Prisma and Redis mocked so no infrastructure is needed.
+The Jest suite covers the auth middleware (missing/forged tokens, roles), the Zod schemas, the real Express app via Supertest (validation errors, login, build ownership, cancellation, and clean 500s), and the worker's build lifecycle (cancelled builds are skipped, build failures are not retried, infrastructure errors are). Prisma, Redis and Docker are mocked so no infrastructure is needed.
 
 ## 📡 API Reference
 
@@ -119,8 +126,8 @@ All endpoints return JSON. Errors always look like `{ "error": "message" }`; val
 | `GET` | `/api/builds/:id/logs` | 🔒 | — | `200` plain-text log of a finished build · `400` while still running |
 | `GET` | `/api/builds/:id/artifact` | 🔒 | — | `200 { url }` pre-signed S3 download link (expires in 15 min) · `400` unless `SUCCESS` |
 | `POST` | `/api/builds/:id/cancel` | 🔒 | — | `200 { message }` · `400` if finished or older than 15 s |
-| `GET` | `/api/analytics` | 🔒 | — | `200 { totalBuilds, successRate, avgDurationSec, metrics: [ { status, _count } ] }` |
-| `GET` | `/api/admin/metrics` | 🔒👑 | — | `200 { totalUsers, builds: { total, byStatus, failureRate }, durationSec: { sampleSize, avg, min, max } }` |
+| `GET` | `/api/analytics` | 🔒 | — | `200 { totalBuilds, successRate, avgDurationSec, byStatus: { SUCCESS: n, FAILED: n, ... } }` (your builds only) |
+| `GET` | `/api/admin/metrics` | 🔒👑 | — | `200 { totalUsers, totalBuilds, byStatus, successRate, failureRate, durationSec: { sampleSize, avg, min, max } }` (all builds; durations from the 50 most recent successful builds) |
 
 **WebSocket (Socket.io):** connect with `auth: { token: "Bearer <token>" }`, then emit `subscribeToBuild` with a build ID. You will receive `build-log` events `{ type: "info" | "error" | "system", text }`, but only for builds you own (or any build, if you're an admin).
 
@@ -137,6 +144,18 @@ Container stdout/stderr is captured by the Worker, published to Redis Pub/Sub, a
 The Worker clones the repository, runs it inside a resource-limited Docker container (512 MB RAM, 50% CPU) via Dockerode, then zips the output and streams it to S3. Artifacts are downloaded through short-lived pre-signed URLs.
 
 ![Dockerode Artifact Storage](docs/artifact-storage.png)
+
+## 🔐 Security Model & Trade-offs
+
+CloudBuildX runs untrusted code, so it's worth being explicit about what is and isn't isolated:
+
+| Area | Current approach | Next step |
+|---|---|---|
+| Build isolation | Each build runs in a fresh Docker container with a 512 MB memory cap, 50% CPU quota, `no-new-privileges`, a 10-minute timeout, and only its own workspace mounted. | Run builds under gVisor or Firecracker microVMs for kernel-level isolation. |
+| Worker privileges | The worker talks to Docker through the mounted host socket, which is effectively root on the host. Acceptable for a single-tenant demo box. | Use a rootless Docker daemon or a separate build host the API can't reach. |
+| Network | Build containers have network access (needed for `npm install`). | Egress allow-list (package registries only). |
+| Transport | The UI is served over HTTPS by Vercel, which proxies to the EC2 backend over HTTP. | Terminate TLS on EC2 (Caddy/nginx + Let's Encrypt) or put it behind an ALB. |
+| Auth | bcrypt password hashes, 24h JWTs carrying the role, ownership checks on every build lookup and WebSocket subscription. The JWT is stored in `localStorage`. | httpOnly cookies + CSRF protection; restrict CORS to the UI origin. |
 
 ## 🐛 Known Issues & Future Improvements
 - **GitHub Webhooks:** Implement GitHub App webhooks to automatically trigger builds when code is pushed to the `main` branch.
