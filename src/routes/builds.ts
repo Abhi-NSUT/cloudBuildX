@@ -4,27 +4,11 @@ import { Prisma, BuildStatus } from '@prisma/client';
 import { AuthRequest, assertOwnerOrAdmin } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
 import { buildQueue, redisConnection } from '../queue';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { logger } from '../logger';
+import { s3Client, BUCKET } from '../clients';
 
-const s3Config: any = process.env.AWS_ACCESS_KEY_ID ? {
-  region: process.env.AWS_REGION || 'us-east-1',
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
-  }
-} : {
-  region: 'us-east-1',
-  endpoint: `http://${process.env.MINIO_ENDPOINT || 'localhost'}:${process.env.MINIO_PORT || 9000}`,
-  credentials: {
-    accessKeyId: process.env.MINIO_ROOT_USER || '',
-    secretAccessKey: process.env.MINIO_ROOT_PASSWORD || ''
-  },
-  forcePathStyle: true
-};
-const s3Client = new S3Client(s3Config);
-const BUCKET = process.env.S3_BUCKET_NAME || 'cloudbuildx-artifacts';
 const CANCEL_WINDOW_MS = 15_000;
 
 // Loads a build and enforces ownership (owner or admin). 404 if missing, 403 if not allowed.

@@ -1,10 +1,10 @@
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
-import IORedis from 'ioredis';
 import { app } from './app';
 import { prisma } from './db';
 import { verifyToken, AuthUser } from './middleware/auth';
 import { logger } from './logger';
+import { createRedis } from './clients';
 
 const port = process.env.PORT || 3000;
 
@@ -16,11 +16,11 @@ const io = new SocketIOServer(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-// 3. Dedicated Redis subscriber connection (a subscribed connection can't run other commands)
-const subscriber = new IORedis((process.env.REDIS_URL as any) || {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: Number(process.env.REDIS_PORT) || 6379,
-});
+// 3. Dedicated Redis subscriber connection (a subscribed connection can't run other commands).
+// One pattern subscription covers every build, so there is nothing to subscribe or
+// clean up per viewer: Socket.io rooms decide who receives which build's lines.
+const subscriber = createRedis();
+subscriber.psubscribe('build-logs:*');
 
 // 4. Authenticate every socket with the same JWT as the REST API
 io.use((socket, next) => {
@@ -54,7 +54,6 @@ io.on('connection', (socket) => {
       }
 
       socket.join(buildId);
-      await subscriber.subscribe(`build-logs:${buildId}`);
     } catch (error: any) {
       logger.error('Socket subscription failed', { buildId, error: error.message, stack: error.stack });
     }
@@ -66,9 +65,8 @@ io.on('connection', (socket) => {
 });
 
 // 5. Relay worker log lines from Redis to the right socket room
-subscriber.on('message', (channel, message) => {
-  if (!channel.startsWith('build-logs:')) return;
-  const buildId = channel.split(':')[1]!;
+subscriber.on('pmessage', (_pattern, channel, message) => {
+  const buildId = channel.slice('build-logs:'.length);
   try {
     io.to(buildId).emit('build-log', JSON.parse(message));
   } catch (error: any) {
