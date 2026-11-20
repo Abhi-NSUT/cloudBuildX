@@ -1,4 +1,4 @@
-import { Worker, Job } from 'bullmq';
+import { Worker, Job, UnrecoverableError } from 'bullmq';
 import IORedis from 'ioredis';
 import { PrismaClient } from '@prisma/client';
 import { Pool } from 'pg';
@@ -69,6 +69,25 @@ const cancelledBuilds = new Set<string>();
 const WORKER_ID = `worker-${crypto.randomBytes(4).toString('hex')}`;
 logger.info('Worker started, listening for jobs on "build-queue"', { workerId: WORKER_ID });
 
+// A failure caused by the user's build itself (bad repo, non-zero exit, timeout).
+// Retrying would just fail again, so these are final. Anything else
+// (registry, S3, database hiccups) is treated as infrastructure and retried.
+class BuildError extends Error {}
+
+type FinalStatus = 'SUCCESS' | 'FAILED' | 'CANCELLED';
+
+// Every system event carries an explicit status so the UI never has to parse log text.
+const publishSystem = (buildId: string, text: string, status?: FinalStatus) =>
+  publisher.publish(`build-logs:${buildId}`, JSON.stringify({ type: 'system', text, ...(status && { status }) }));
+
+// Only move RUNNING -> final. If the API already marked the build CANCELLED,
+// this is a no-op and the cancellation wins.
+const finishBuild = (buildId: string, status: 'SUCCESS' | 'FAILED') =>
+  prisma.build.updateMany({
+    where: { id: buildId, status: 'RUNNING' },
+    data: { status, completedAt: new Date() },
+  });
+
 const worker = new Worker('build-queue', async (job: Job) => {
   const { buildId, repositoryUrl, commitHash } = job.data;
   
@@ -78,21 +97,29 @@ const worker = new Worker('build-queue', async (job: Job) => {
   let logFileStream: fsSync.WriteStream | null = null;
 
   const buildStartedAt = Date.now();
+  activeJobs.add(buildId);
+
+  // Atomically claim the build. A build cancelled while still queued (or already
+  // finished) is skipped. RUNNING is allowed so a stalled job can be recovered.
+  const claim = await prisma.build.updateMany({
+    where: { id: buildId, status: { in: ['PENDING', 'RUNNING'] } },
+    data: { status: 'RUNNING', startedAt: new Date(), workerNode: WORKER_ID },
+  });
+  if (claim.count === 0) {
+    activeJobs.delete(buildId);
+    logger.info('Skipping build that is no longer pending (cancelled or finished)', { buildId });
+    return;
+  }
+
   logger.info('Build started', { buildId, jobId: job.id, attempt: job.attemptsMade + 1, workerId: WORKER_ID, repositoryUrl });
   recordBuildStarted();
-  activeJobs.add(buildId);
 
   try {
     // Create a write stream for the historical log file right at the start
     logFileStream = fsSync.createWriteStream(logFilePath, { flags: 'a' });
 
-    await prisma.build.update({
-      where: { id: buildId },
-      data: { status: 'RUNNING', startedAt: new Date(), workerNode: WORKER_ID }
-    });
-
     const initMsg = `Job claimed by ${WORKER_ID}. Starting execution...`;
-    publisher.publish(`build-logs:${buildId}`, JSON.stringify({ type: 'system', text: initMsg }));
+    publishSystem(buildId, initMsg);
     logFileStream.write(`${initMsg}\r\n`);
 
     // 1. Ensure a clean slate (Forcefully remove ghost directories)
@@ -108,11 +135,14 @@ const worker = new Worker('build-queue', async (job: Job) => {
     logger.info(`[Job ${job.id}] Cloning repository...`);
     const git = simpleGit();
     
-    await git.clone(repositoryUrl, workspaceDir);
-    
-    if (commitHash) {
-      logger.info(`[Job ${job.id}] Checking out commit ${commitHash}...`);
-      await simpleGit(workspaceDir).checkout(commitHash);
+    try {
+      await git.clone(repositoryUrl, workspaceDir);
+      if (commitHash) {
+        logger.info(`[Job ${job.id}] Checking out commit ${commitHash}...`);
+        await simpleGit(workspaceDir).checkout(commitHash);
+      }
+    } catch (gitErr: any) {
+      throw new BuildError(`Could not clone repository: ${gitErr.message}`);
     }
     logger.info(`[Job ${job.id}] Repository cloned successfully.`);
     
@@ -214,19 +244,22 @@ const worker = new Worker('build-queue', async (job: Job) => {
     // 8. Wait for Exit with a Hard Timeout
     const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes maximum
     let exitCode: number;
+    let timeoutHandle: NodeJS.Timeout | undefined;
 
     try {
       exitCode = await Promise.race([
         container.wait().then(data => data.StatusCode),
-        new Promise<number>((_, reject) => 
-          setTimeout(async () => {
-            logger.info(`[Job ${job.id}] Timeout reached! Killing container...`);
-            await container.kill(); 
-            reject(new Error('Build timed out after 10 minutes'));
-          }, TIMEOUT_MS)
-        )
+        new Promise<number>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            logger.warn('Build timed out, killing container', { buildId });
+            container.kill().catch(() => {});
+            reject(new BuildError('Build timed out after 10 minutes'));
+          }, TIMEOUT_MS);
+        })
       ]);
     } finally {
+      // Always clear the timer, otherwise it fires 10 minutes later on a removed container
+      clearTimeout(timeoutHandle);
       // 9. Clean up the container from Docker Engine
       logger.info(`[Job ${job.id}] Removing container from host...`);
       // We remove it from activeContainers here so that we don't try to kill it 
@@ -236,12 +269,14 @@ const worker = new Worker('build-queue', async (job: Job) => {
     }
 
     if (exitCode !== 0) {
-      throw new Error(`Build failed with exit code ${exitCode}`);
+      throw new BuildError(`Build failed with exit code ${exitCode}`);
     }
+
+    if (cancelledBuilds.has(buildId)) throw new Error('BUILD_CANCELLED');
 
     // 9.5 Zip and Upload Artifacts to MinIO
     logger.info(`[Job ${job.id}] Zipping artifacts and uploading to MinIO...`);
-    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Compressing and uploading artifacts...' }));
+    publishSystem(buildId, 'Compressing and uploading artifacts...');
     logFileStream.write(`\r\n\x1b[35m[SYSTEM EVENT] Compressing and uploading artifacts...\x1b[0m\r\n`);
     
     const archive = new (archiver as any).ZipArchive({ zlib: { level: 9 } });
@@ -265,38 +300,44 @@ const worker = new Worker('build-queue', async (job: Job) => {
     await upload.done();
     
     logger.info(`[Job ${job.id}] Artifacts uploaded successfully.`);
-    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Artifacts uploaded successfully.' }));
+    publishSystem(buildId, 'Artifacts uploaded successfully.');
 
-    // 10. Mark Success in PostgreSQL
-    await prisma.build.update({
-      where: { id: buildId },
-      data: { status: 'SUCCESS', completedAt: new Date() }
-    });
+    // 10. Mark Success in PostgreSQL (unless it was cancelled meanwhile)
+    const finished = await finishBuild(buildId, 'SUCCESS');
+    if (finished.count === 0) throw new Error('BUILD_CANCELLED');
+
     const durationMs = Date.now() - buildStartedAt;
     logger.info('Build finished', { buildId, status: 'SUCCESS', durationMs });
     recordBuildFinished(buildId, 'success', durationMs);
-    publisher.publish(channel, JSON.stringify({ type: 'system', text: 'Build completed successfully.' }));
+    publishSystem(buildId, 'Build completed successfully.', 'SUCCESS');
 
   } catch (error: any) {
     if (cancelledBuilds.has(buildId) || error.message === 'BUILD_CANCELLED') {
       const durationMs = Date.now() - buildStartedAt;
       logger.warn('Build finished', { buildId, status: 'CANCELLED', durationMs });
       recordBuildFinished(buildId, 'cancelled', durationMs);
-      const channel = `build-logs:${buildId}`;
-      publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build cancelled by user.` }));
+      publishSystem(buildId, 'Build cancelled by user.', 'CANCELLED');
       if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build cancelled by user.\x1b[0m\r\n`);
     } else {
-      await prisma.build.update({
-        where: { id: buildId },
-        data: { status: 'FAILED', completedAt: new Date() }
-      });
+      const isBuildError = error instanceof BuildError;
+      const willRetry = !isBuildError && job.attemptsMade + 1 < (job.opts.attempts ?? 1);
+
+      if (willRetry) {
+        // Infrastructure hiccup: put the build back to PENDING and let BullMQ retry with backoff
+        await prisma.build.updateMany({ where: { id: buildId, status: 'RUNNING' }, data: { status: 'PENDING' } });
+        logger.warn('Build hit an infrastructure error, will retry', { buildId, attempt: job.attemptsMade + 1, error: error.message });
+        publishSystem(buildId, `Infrastructure error (${error.message}). Retrying...`);
+        throw error;
+      }
+
+      await finishBuild(buildId, 'FAILED');
       const durationMs = Date.now() - buildStartedAt;
       logger.error('Build finished', { buildId, status: 'FAILED', durationMs, attempt: job.attemptsMade + 1, error: error.message, stack: error.stack });
       recordBuildFinished(buildId, 'failed', durationMs);
-      const channel = `build-logs:${buildId}`;
-      publisher.publish(channel, JSON.stringify({ type: 'system', text: `Build failed: ${error.message}` }));
+      publishSystem(buildId, `Build failed: ${error.message}`, 'FAILED');
       if (logFileStream) logFileStream.write(`\r\n\x1b[31m[SYSTEM EVENT] Build failed: ${error.message}\x1b[0m\r\n`);
-      throw error;
+      // UnrecoverableError tells BullMQ not to retry a build that failed on its own merits
+      throw new UnrecoverableError(error.message);
     }
   } finally {
     activeJobs.delete(buildId);

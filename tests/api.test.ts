@@ -7,20 +7,21 @@ import jwt from 'jsonwebtoken';
 jest.mock('../src/db', () => ({
   prisma: {
     user: { findUnique: jest.fn(), create: jest.fn() },
-    build: { findUnique: jest.fn() },
+    build: { findUnique: jest.fn(), update: jest.fn() },
   },
 }));
 jest.mock('../src/queue', () => ({
-  buildQueue: { add: jest.fn() },
+  buildQueue: { add: jest.fn(), remove: jest.fn().mockResolvedValue(1) },
   redisConnection: { publish: jest.fn(), get: jest.fn(), set: jest.fn(), del: jest.fn() },
 }));
 
 import { app } from '../src/app';
 import { prisma } from '../src/db';
+import { buildQueue, redisConnection } from '../src/queue';
 
 const db = prisma as unknown as {
   user: { findUnique: jest.Mock; create: jest.Mock };
-  build: { findUnique: jest.Mock };
+  build: { findUnique: jest.Mock; update: jest.Mock };
 };
 
 const tokenFor = (id: string, role: 'USER' | 'ADMIN' = 'USER') =>
@@ -84,5 +85,20 @@ describe('GET /api/builds/:id', () => {
 
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Internal server error' });
+  });
+});
+
+describe('POST /api/builds/:id/cancel', () => {
+  it('marks a queued build CANCELLED, removes its job from the queue and signals the workers', async () => {
+    db.build.findUnique.mockResolvedValue({
+      id: 'b1', status: 'PENDING', createdAt: new Date(), repository: { userId: 'owner-1' },
+    });
+
+    const res = await request(app).post('/api/builds/b1/cancel').set('Authorization', tokenFor('owner-1'));
+
+    expect(res.status).toBe(200);
+    expect(db.build.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'CANCELLED' }) }));
+    expect(buildQueue.remove).toHaveBeenCalledWith('b1');
+    expect(redisConnection.publish).toHaveBeenCalledWith('cancel-build', 'b1');
   });
 });

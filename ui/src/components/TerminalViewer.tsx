@@ -93,7 +93,7 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
     });
 
     // 3. Process Inbound Log Chunks
-    socket.on('build-log', (data: { type: string; text: string }) => {
+    socket.on('build-log', (data: { type: string; text: string; status?: string }) => {
       // Normalize lines to ensure carriage returns for canvas positioning
       const formattedText = data.text.replace(/\r?\n/g, '\r\n');
 
@@ -102,10 +102,8 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ buildId, initial
       } else if (data.type === 'system') {
         term.writeln(`\r\n\x1b[35m[SYSTEM EVENT] ${formattedText}\x1b[0m\r\n`);
         
-        let finalStatus: string | null = null;
-        if (formattedText.includes('completed')) finalStatus = 'SUCCESS';
-        else if (formattedText.includes('cancelled')) finalStatus = 'CANCELLED';
-        else if (formattedText.includes('failed')) finalStatus = 'FAILED';
+        // The worker sends an explicit final status, so log text can never fake one
+        const finalStatus = data.status ?? null;
 
         if (finalStatus) {
           if (onStatusChange) onStatusChange(finalStatus);

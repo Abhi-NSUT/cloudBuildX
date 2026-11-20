@@ -55,6 +55,8 @@ export const createBuild = async (req: AuthRequest, res: Response) => {
     repositoryUrl: repo.githubUrl,
     commitHash: build.commitHash,
   }, {
+    jobId: build.id, // lets us find and remove the job if the build is cancelled while queued
+    // Retries only apply to infrastructure errors; the worker marks real build failures unrecoverable
     attempts: 3,
     backoff: { type: 'exponential', delay: 5000 },
     removeOnComplete: true,
@@ -174,7 +176,10 @@ export const cancelBuild = async (req: AuthRequest, res: Response) => {
     data: { status: 'CANCELLED', completedAt: new Date() },
   });
 
-  // Broadcast the kill signal to the workers (reuses the shared connection)
+  // Still queued: drop the job so no worker picks it up (returns 0 if a worker already has it)
+  await buildQueue.remove(build.id).catch(() => 0);
+
+  // Already running: broadcast the kill signal to the workers
   await redisConnection.publish('cancel-build', build.id);
 
   logger.info('Build cancelled', { buildId: build.id, userId: req.user!.id });
